@@ -1,0 +1,28 @@
+[package]
+name = "vassoura"
+version = "0.1.0"
+edition = "2021"
+description = "Coletor de build-lixo com marca d'água: evicta o regenerável menos usado antes do disco encher, com ledger auditável"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+fs2 = "0.4"
+jiff = "0.2"
+humansize = "2"
+
+[dev-dependencies]
+filetime = "0.2"
+tempfile = "3"
+
+[lib]
+name = "vassoura"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vassoura"
+path = "src/main.rs"
