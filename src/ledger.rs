@@ -2,8 +2,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-/// Uma linha do ledger append-only — a "proveniência" da limpeza:
-/// o que saiu, quando, quanto, com que idade e como regenerar.
+/// One line of the append-only ledger — the provenance of a cleanup:
+/// what left, when, how much, at what age, and how to regenerate it.
 #[derive(Debug, serde::Serialize)]
 pub struct Line {
     pub ts: i64,
@@ -21,5 +21,5 @@ pub fn append(ledger: &Path, line: &Line) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut f = OpenOptions::new().create(true).append(true).open(ledger)?;
-    writeln!(f, "{}", serde_json::to_string(line).expect("ledger serializa"))
+    writeln!(f, "{}", serde_json::to_string(line).expect("ledger serializes"))
 }

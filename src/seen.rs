@@ -1,9 +1,10 @@
-//! seen.db (P2.1): registro persistente por candidato da última atividade
-//! "vista" pelo daemon. Cada ciclo de poll compara o mtime atual com o do
-//! ciclo anterior: mudou → houve atividade → `last_seen` avança para agora;
-//! não mudou → `last_seen` fica no passado (candidato frio, sai primeiro na
-//! ordem LRU). Candidato sem registro usa mtime como fallback. O registro
-//! (e o timestamp da última evicção, para o rate-limit) sobrevive a restart.
+//! seen.db (P2.1): a persistent per-candidate record of the last activity
+//! the daemon "saw". Each poll cycle compares the current mtime with the
+//! previous cycle's: it changed → there was activity → `last_seen` moves to
+//! now; it did not change → `last_seen` stays in the past (a cold candidate,
+//! first in LRU order). A candidate with no record falls back to mtime. The
+//! record (and the timestamp of the last eviction, for the rate-limit)
+//! survives a restart.
 
 use std::collections::HashMap;
 use std::fs;
@@ -14,17 +15,17 @@ use crate::walk::Candidate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeenEntry {
-    /// Último ciclo em que o candidato mostrou atividade (mtime mudou).
+    /// Last cycle in which the candidate showed activity (mtime changed).
     pub last_seen: SystemTime,
-    /// Fingerprint do ciclo anterior (mtime mais novo visto).
+    /// Fingerprint of the previous cycle (newest mtime seen).
     pub last_mtime: SystemTime,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SeenDb {
-    /// Última evicção executada pelo daemon (rate-limit entre ciclos).
+    /// Last eviction run by the daemon (rate-limit between cycles).
     pub last_eviction: Option<SystemTime>,
-    /// path → registro.
+    /// path → record.
     pub entries: HashMap<String, SeenEntry>,
 }
 
@@ -55,7 +56,7 @@ impl SeenDb {
             return SeenDb::default();
         };
         let Ok(j) = serde_json::from_str::<SeenDbJson>(&raw) else {
-            return SeenDb::default(); // corrompido → recomeça frio (fallback mtime)
+            return SeenDb::default(); // corrupt → start cold again (mtime fallback)
         };
         SeenDb {
             last_eviction: j.last_eviction.map(from_nanos),
@@ -96,21 +97,21 @@ impl SeenDb {
                 })
                 .collect(),
         };
-        // escrita atômica: temp + rename no mesmo diretório
+        // atomic write: temp + rename in the same directory
         let tmp = path.with_extension("db.tmp");
-        fs::write(&tmp, serde_json::to_string(&j).expect("seen.db serializa"))?;
+        fs::write(&tmp, serde_json::to_string(&j).expect("seen.db serializes"))?;
         fs::rename(&tmp, path)
     }
 
-    /// Atualiza o registro com os candidatos vistos neste ciclo: mtime mudou
-    /// desde o ciclo anterior → atividade (last_seen = agora); candidato novo
-    /// → last_seen nasce no próprio mtime (fallback conservador).
+    /// Update the record with the candidates seen this cycle: mtime changed
+    /// since the previous cycle → activity (last_seen = now); a new candidate
+    /// → last_seen is born at its own mtime (conservative fallback).
     pub fn refresh(&mut self, cands: &[Candidate], now: SystemTime) {
         for c in cands {
             let key = c.path.display().to_string();
             let e = self.entries.get_mut(&key);
             match e {
-                Some(e) if e.last_mtime == c.newest_mtime => {} // frio: mantém last_seen
+                Some(e) if e.last_mtime == c.newest_mtime => {} // cold: keep last_seen
                 Some(e) => {
                     e.last_seen = now;
                     e.last_mtime = c.newest_mtime;
@@ -125,8 +126,8 @@ impl SeenDb {
         }
     }
 
-    /// Chave de ordenação LRU do candidato: último-visto se houver registro,
-    /// mtime como fallback.
+    /// LRU sort key for the candidate: last-seen if there is a record,
+    /// mtime as fallback.
     pub fn last_used(&self, cand: &Candidate) -> SystemTime {
         self.entries
             .get(&cand.path.display().to_string())
@@ -151,6 +152,7 @@ mod tests {
             class: Class::Artifact,
             bytes: 10,
             newest_mtime: SystemTime::now() - Duration::from_secs(age_secs),
+            root_mtime: SystemTime::now() - Duration::from_secs(age_secs),
             contains_git: false,
             entries: 1,
         }
@@ -168,10 +170,10 @@ mod tests {
         db.persist(&p).unwrap();
 
         let back = SeenDb::load(&p);
-        assert_eq!(back.last_eviction, Some(now), "nanos preservados no round-trip");
+        assert_eq!(back.last_eviction, Some(now), "nanos preserved across the round-trip");
         assert_eq!(back.entries.len(), 1);
         let e = &back.entries["/x/nm"];
-        assert_eq!(e.last_seen, c.newest_mtime, "novo nasce no mtime");
+        assert_eq!(e.last_seen, c.newest_mtime, "a new one is born at mtime");
         assert_eq!(e.last_mtime, c.newest_mtime);
     }
 
@@ -182,17 +184,17 @@ mod tests {
         let hot = cand("/b/nm", 500_000);
         let cycle1 = SystemTime::now() - Duration::from_secs(3600);
         db.refresh(&[cold.clone(), hot.clone()], cycle1);
-        // nascem no próprio mtime (fallback conservador)
+        // born at their own mtime (conservative fallback)
         assert_eq!(db.last_used(&cold), cold.newest_mtime);
         assert_eq!(db.last_used(&hot), hot.newest_mtime);
 
-        // um ciclo depois: /b foi escrito (mtime novo), /a não
+        // one cycle later: /b was written (new mtime), /a was not
         let later = SystemTime::now();
         let hot2 = Candidate { newest_mtime: later - Duration::from_secs(5), ..hot.clone() };
         db.refresh(&[cold.clone(), hot2.clone()], later);
 
-        assert_eq!(db.last_used(&cold), cold.newest_mtime, "frio mantém seen");
-        assert_eq!(db.last_used(&hot2), later, "atividade avança o seen");
+        assert_eq!(db.last_used(&cold), cold.newest_mtime, "cold keeps seen");
+        assert_eq!(db.last_used(&hot2), later, "activity advances seen");
     }
 
     #[test]
@@ -215,9 +217,9 @@ mod tests {
         let mut db = SeenDb::default();
         let old = SystemTime::now() - Duration::from_secs(90 * 86400);
 
-        // `restored`: mtime VELHO (90d, extraído de arquivo), mas o daemon o
-        // viu mudando AGORA (arquivo chegou ontem, mtimes vieram antigos):
-        // o seen recente protege — é o caso onde seen ≠ mtime.
+        // `restored`: OLD mtime (90d, extracted from an archive), but the daemon
+        // saw it change NOW (the file arrived yesterday, mtimes came in old):
+        // the recent seen protects it — the case where seen ≠ mtime.
         let mut restored = cand("/restored", 0);
         restored.newest_mtime = old;
         let cycle1 = SystemTime::now() - Duration::from_secs(86400);
@@ -228,7 +230,7 @@ mod tests {
         db.refresh(std::slice::from_ref(&changed), cycle2);
         db.refresh(std::slice::from_ref(&restored), cycle2); // mtime voltou a 90d
 
-        // `virgem`: mtime 90d, nunca visto → fallback mtime
+        // `virgem`: mtime 90d, never seen → mtime fallback
         let virgem = cand("/virgem", 90 * 86400);
 
         let mut keyed = vec![
@@ -236,7 +238,7 @@ mod tests {
             ("/virgem", db.last_used(&virgem)),
         ];
         keyed.sort_by_key(|(_, k)| *k);
-        assert_eq!(keyed[0].0, "/virgem", "nunca-visto (mtime 90d) sai primeiro");
+        assert_eq!(keyed[0].0, "/virgem", "never-seen (mtime 90d) leaves first");
         assert!(keyed[1].0 == "/restored" && db.last_used(&restored) > old);
     }
 }

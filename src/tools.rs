@@ -1,13 +1,13 @@
-//! Classes de ferramenta (P1.3): evicção estendida a coisas que não são
-//! diretórios de build — modelos ollama (LRU por modified via `ollama rm`),
-//! docker/orbstack prune (a construção do comando JAMAIS toca volumes),
-//! toolchains rustup velhas (mantém as N mais novas), `pnpm store prune` e
+//! Tool classes (P1.3): eviction extended to things that are not build
+//! directories — ollama models (LRU by modified time via `ollama rm`),
+//! docker/orbstack prune (the command is constructed so it NEVER touches
+//! volumes), old rustup toolchains (keeps the N newest), `pnpm store prune`, and
 //! `go clean -modcache`.
 //!
-//! Separação: SELEÇÃO é lógica pura (testada aqui); EXECUÇÃO só acontece via
-//! o CLI da própria ferramenta, é seca por default (`--apply`) e fail-closed:
-//! ferramenta ausente/quebrada é pulada e reportada. Toda remoção executada
-//! grava linha no ledger com dica de regeneração.
+//! Split: SELECTION is pure logic (tested here); EXECUTION happens only
+//! through the tool's own CLI, is dry by default (`--apply`), and is
+//! fail-closed: a missing or broken tool is skipped and reported. Every
+//! removal that runs writes a ledger line with a regeneration hint.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -17,13 +17,13 @@ use std::time::{Duration, SystemTime};
 use crate::config::{Config, ToolsCfg};
 use crate::fmt_util::{age_days, GIB};
 
-// ---------------------------------------------------------------- seleção
+// ---------------------------------------------------------------- selection
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OllamaModel {
     pub name: String,
     pub bytes: u64,
-    /// Última modificação (coluna MODIFIED do `ollama list`).
+    /// Last modification (MODIFIED column of `ollama list`).
     pub used: SystemTime,
 }
 
@@ -57,9 +57,9 @@ fn relative_age_secs(n: u64, unit: &str) -> Option<u64> {
     Some(n * per)
 }
 
-/// Parseia `ollama list`. Linhas sem MODIFIED legível são FAIL-CLOSED:
-/// ficam de fora do plano (nunca removemos o que não sabemos medir).
-/// Devolve (modelos parseados, linhas descartadas).
+/// Parse `ollama list`. Lines without a readable MODIFIED are FAIL-CLOSED:
+/// they stay out of the plan (we never remove what we cannot measure).
+/// Returns (parsed models, discarded lines).
 pub fn parse_ollama_list(output: &str, now: SystemTime) -> (Vec<OllamaModel>, usize) {
     let mut out = Vec::new();
     let mut skipped = 0usize;
@@ -68,7 +68,7 @@ pub fn parse_ollama_list(output: &str, now: SystemTime) -> (Vec<OllamaModel>, us
         if tok.is_empty() || tok[0] == "NAME" {
             continue;
         }
-        // formato esperado: NAME ID SIZE "N unit ago" (SIZE pode ter espaço:
+        // expected format: NAME ID SIZE "N unit ago" (SIZE may contain a space:
         // "5.4 GB")
         let Some(ago) = tok.iter().rposition(|t| *t == "ago") else {
             skipped += 1;
@@ -104,7 +104,7 @@ pub fn parse_ollama_list(output: &str, now: SystemTime) -> (Vec<OllamaModel>, us
     (out, skipped)
 }
 
-/// LRU por modified: mais velho primeiro até cobrir `need_bytes`.
+/// LRU by modified: oldest first until `need_bytes` is covered.
 pub fn select_ollama(models: &[OllamaModel], need_bytes: u64) -> Vec<&OllamaModel> {
     let mut sorted: Vec<&OllamaModel> = models.iter().collect();
     sorted.sort_by_key(|m| m.used);
@@ -124,7 +124,7 @@ pub fn select_ollama(models: &[OllamaModel], need_bytes: u64) -> Vec<&OllamaMode
 pub struct Toolchain {
     pub name: String,
     pub default: bool,
-    /// Versão semver do nome (None = canal/rolling → protegido).
+    /// Semver of the name (None = channel/rolling → protected).
     pub version: Option<(u64, u64, u64)>,
 }
 
@@ -137,8 +137,8 @@ fn parse_version(name: &str) -> Option<(u64, u64, u64)> {
     Some((a, b, c))
 }
 
-/// Parseia `rustup toolchain list` (linhas "N.N.N-triple" com marcador
-/// "(default)" opcional).
+/// Parse `rustup toolchain list` (lines "N.N.N-triple" with an optional
+/// "(default)" marker).
 pub fn parse_rustup_list(output: &str) -> Vec<Toolchain> {
     output
         .lines()
@@ -158,8 +158,8 @@ pub fn parse_rustup_list(output: &str) -> Vec<Toolchain> {
         .collect()
 }
 
-/// Mantém as `keep` toolchains VERSIONADAS mais novas (e tudo que é canal
-/// rolling, custom ou default). O resto sai.
+/// Keep the `keep` newest VERSIONED toolchains (and everything that is a
+/// rolling channel, custom, or default). The rest leaves.
 pub fn select_rustup(tcs: &[Toolchain], keep: usize) -> Vec<&Toolchain> {
     let mut versioned: Vec<&Toolchain> = tcs
         .iter()
@@ -172,30 +172,30 @@ pub fn select_rustup(tcs: &[Toolchain], keep: usize) -> Vec<&Toolchain> {
     versioned[..versioned.len() - keep].to_vec()
 }
 
-// ---------------------------------------------------------------- ações
+// ---------------------------------------------------------------- actions
 
 #[derive(Debug, Clone)]
 pub struct ToolAction {
     pub tool: &'static str,
-    /// O que sai (nome do modelo, toolchain, ou classe do prune).
+    /// What leaves (model name, toolchain, or prune class).
     pub subject: String,
-    /// argv SEM o binário (resolvido na execução).
+    /// argv WITHOUT the binary (resolved at execution).
     pub argv: Vec<String>,
-    /// Como regenerar — vai para o ledger.
+    /// How to regenerate — goes into the ledger.
     pub hint: String,
     pub bytes: u64,
-    /// Último uso, se soubermos (para idade no ledger).
+    /// Last use, if we know it (for the age in the ledger).
     pub used: Option<SystemTime>,
 }
 
-/// docker/orbstack prune: a construção NUNCA inclui volumes ou o subcomando
-/// `volume` — volumes de dados são intocáveis por construção.
+/// docker/orbstack prune: the construction NEVER includes volumes or the
+/// `volume` subcommand — data volumes are untouchable by construction.
 pub fn docker_action() -> ToolAction {
     ToolAction {
         tool: "docker",
         subject: "docker system prune".into(),
         argv: vec!["system".into(), "prune".into(), "--force".into()],
-        hint: "docker pull/build recria imagens e camadas".into(),
+        hint: "docker pull/build recreates images and layers".into(),
         bytes: 0,
         used: None,
     }
@@ -206,7 +206,7 @@ pub fn pnpm_action() -> ToolAction {
         tool: "pnpm",
         subject: "pnpm store prune".into(),
         argv: vec!["store".into(), "prune".into()],
-        hint: "pnpm install baixa de volta o que for necessário".into(),
+        hint: "pnpm install fetches whatever is needed again".into(),
         bytes: 0,
         used: None,
     }
@@ -217,7 +217,7 @@ pub fn go_action() -> ToolAction {
         tool: "go",
         subject: "go clean -modcache".into(),
         argv: vec!["clean".into(), "-modcache".into()],
-        hint: "go mod download reconstroi o cache de módulos".into(),
+        hint: "go mod download rebuilds the module cache".into(),
         bytes: 0,
         used: None,
     }
@@ -250,10 +250,10 @@ pub fn rustup_actions(tcs: &[&Toolchain]) -> Vec<ToolAction> {
         .collect()
 }
 
-// --------------------------------------------------------------- execução
+// --------------------------------------------------------------- execution
 
-/// Caminho dos binários (produção: nomes resolvidos pelo PATH; testes:
-/// fakes injetáveis).
+/// Paths of the binaries (production: names resolved via PATH; tests:
+/// injectable fakes).
 #[derive(Debug, Clone)]
 pub struct Bins {
     pub ollama: OsString,
@@ -297,7 +297,7 @@ fn list_output(bin: &OsString, args: &[&str]) -> Result<String, ListErr> {
     let out = Command::new(bin)
         .args(args)
         .output()
-        .map_err(|e| ListErr::Missing(format!("binário indisponível: {e}")))?;
+        .map_err(|e| ListErr::Missing(format!("binary unavailable: {e}")))?;
     if !out.status.success() {
         return Err(ListErr::Failed(format!(
             "exit {:?}: {}",
@@ -308,8 +308,8 @@ fn list_output(bin: &OsString, args: &[&str]) -> Result<String, ListErr> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Levanta o plano de todas as classes habilitadas. `free` decide o alvo
-/// (need = marca alta − livres; na meta → nada a fazer).
+/// Build the plan of every enabled class. `free` decides the target
+/// (need = high mark − free; at the target → nothing to do).
 pub fn gather(cfg: &Config, bins: &Bins, free: u64) -> Vec<ToolPlan> {
     let t: &ToolsCfg = &cfg.tools;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
@@ -328,9 +328,9 @@ pub fn gather(cfg: &Config, bins: &Bins, free: u64) -> Vec<ToolPlan> {
                     let sel = select_ollama(&models, need);
                     let mut acts = ollama_actions(&sel);
                     if skipped > 0 {
-                        // linhas ilegíveis ficam de fora, mas o motivo é dito
+                        // unreadable lines stay out, but the reason is stated
                         for a in &mut acts {
-                            a.hint = format!("{} [{} modelo(s) fora do plano: modified ilegível]", a.hint, skipped);
+                            a.hint = format!("{} [{} model(s) left out of the plan: unreadable modified]", a.hint, skipped);
                         }
                     }
                     ToolPlanOutcome::Plan(acts)
@@ -377,8 +377,8 @@ pub fn gather(cfg: &Config, bins: &Bins, free: u64) -> Vec<ToolPlan> {
 pub enum RunStatus {
     Missing,
     Failed(String),
-    /// Executou; bytes confirmados (docker parseia stdout; ollama usa a
-    /// estimativa do list; pnpm/go não reportam e ficam 0).
+    /// Ran; confirmed bytes (docker parses stdout; ollama uses the
+    /// list estimate; pnpm/go do not report and stay 0).
     Ran { reclaimed_bytes: u64 },
 }
 
@@ -400,8 +400,8 @@ fn parse_docker_reclaimed(stdout: &str) -> u64 {
     0
 }
 
-/// Executa UMA ação via o CLI da ferramenta e grava a linha do ledger.
-/// Fail-closed: binário sumiu → Missing (nada acontece, sem ledger).
+/// Run ONE action through the tool's own CLI and write the ledger line.
+/// Fail-closed: binary gone → Missing (nothing happens, no ledger).
 pub fn run_action(bin: &OsString, a: &ToolAction, ledger: &Path) -> RunOutcome {
     let out = match Command::new(bin).args(&a.argv).output() {
         Err(_) => {
@@ -444,7 +444,7 @@ pub fn run_action(bin: &OsString, a: &ToolAction, ledger: &Path) -> RunOutcome {
         hint: a.hint.clone(),
     };
     if let Err(e) = crate::ledger::append(ledger, &line) {
-        eprintln!("# ERRO ledger {e} (ação executada: {})", a.subject);
+        eprintln!("# LEDGER ERROR {e} (action already ran: {})", a.subject);
     }
     RunOutcome {
         tool: a.tool,
@@ -489,11 +489,11 @@ mod tests {
         assert_eq!(models.len(), 3);
         assert_eq!(models[0].bytes, (5.4 * 1024.0 * 1024.0 * 1024.0) as u64);
 
-        // need 9 GiB: mais velho primeiro — llama3 (2 meses) + gemma2 (3 sem)
+        // need 9 GiB: oldest first — llama3 (2 months) + gemma2 (3 weeks)
         let sel = select_ollama(&models, 9 * GIB);
         assert_eq!(sel.iter().map(|m| m.name.clone()).collect::<Vec<_>>(), ["llama3:8b", "gemma2:2b"]);
 
-        // need pequeno: só o mais velho
+        // small need: only the oldest
         let sel1 = select_ollama(&models, 1 * GIB);
         assert_eq!(sel1.len(), 1);
         assert_eq!(sel1[0].name, "llama3:8b");
@@ -504,7 +504,7 @@ mod tests {
         let list = "NAME       ID        SIZE\ngemma2:2b  b0f9d2   5.4 GB\n";
         let (models, skipped) = parse_ollama_list(list, SystemTime::now());
         assert!(models.is_empty());
-        assert_eq!(skipped, 1, "sem MODIFIED legível não entra no plano");
+        assert_eq!(skipped, 1, "without a readable MODIFIED it does not enter the plan");
     }
 
     #[test]
@@ -522,9 +522,9 @@ mod tests {
         assert_eq!(
             sel.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
             ["1.74.0-aarch64-apple-darwin", "1.75.0-aarch64-apple-darwin"],
-            "mantém as 2 mais novas; canais e default ficam"
+            "keeps the 2 newest; channels and default stay"
         );
-        // keep ≥ tudo → nada sai
+        // keep ≥ everything → nothing leaves
         assert!(select_rustup(&tcs, 10).is_empty());
     }
 
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(a.argv, vec!["system", "prune", "--force"]);
         assert!(
             !a.argv.iter().any(|x| x.contains("volume")),
-            "o prune jamais inclui volumes"
+            "prune never includes volumes"
         );
         assert!(!a.argv.contains(&"volume".to_string()));
     }
@@ -566,6 +566,6 @@ mod tests {
         let a = ollama_actions(&[&models[0]]).remove(0);
         let out = run_action(&bins.ollama, &a, &ledger);
         assert!(matches!(out.status, RunStatus::Missing));
-        assert!(!ledger.exists(), "fail-closed não nasce ledger");
+        assert!(!ledger.exists(), "fail-closed does not create a ledger");
     }
 }

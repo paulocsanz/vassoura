@@ -1,6 +1,6 @@
-//! fs de status (P2.2): um diretório com UM arquivo simples por métrica
-//! (default `~/Vassoura`), preenchido pelo `vassoura refresh` e por cada
-//! ciclo do daemon, sempre com os mesmos valores de `vassoura status --json`.
+//! Status directory (P2.2): one plain file per metric (default `~/Vassoura`),
+//! filled by `vassoura refresh` and by every daemon cycle, always with the
+//! same values as `vassoura status --json`.
 
 use std::fs;
 use std::io;
@@ -15,7 +15,7 @@ pub struct StatusReport {
     pub updated_iso: String,
     pub disk: DiskReport,
     pub watermarks: Watermarks,
-    /// "critico" | "apertado" | "ok"
+    /// "critical" | "tight" | "ok"
     pub verdict: String,
     pub eligible: Eligible,
     pub need_bytes: u64,
@@ -42,9 +42,9 @@ pub struct Eligible {
 
 pub fn verdict_of(free: u64, low_bytes: u64, high_bytes: u64) -> &'static str {
     if free < low_bytes {
-        "critico"
+        "critical"
     } else if free < high_bytes {
-        "apertado"
+        "tight"
     } else {
         "ok"
     }
@@ -67,7 +67,7 @@ pub fn build_report(disk: Disk, cfg: &Config, eligible_bytes: u64, eligible_coun
     }
 }
 
-/// Escreve um arquivo por métrica; devolve os arquivos escritos.
+/// Write one file per metric; return the files written.
 pub fn write_status_dir(dir: &Path, r: &StatusReport) -> io::Result<Vec<std::path::PathBuf>> {
     fs::create_dir_all(dir)?;
     let metrics: Vec<(&str, String)> = vec![
@@ -106,8 +106,8 @@ mod tests {
     #[test]
     fn verdicts_match_marks() {
         let gib = GIB as u64;
-        assert_eq!(verdict_of(30 * gib, 40 * gib, 100 * gib), "critico");
-        assert_eq!(verdict_of(50 * gib, 40 * gib, 100 * gib), "apertado");
+        assert_eq!(verdict_of(30 * gib, 40 * gib, 100 * gib), "critical");
+        assert_eq!(verdict_of(50 * gib, 40 * gib, 100 * gib), "tight");
         assert_eq!(verdict_of(120 * gib, 40 * gib, 100 * gib), "ok");
     }
 
@@ -126,9 +126,9 @@ mod tests {
         assert_eq!(read("disk_used_pct"), format!("{:.2}", r.disk.used_pct));
         assert_eq!(read("eligible_bytes"), r.eligible.bytes.to_string());
         assert_eq!(read("need_bytes"), r.need_bytes.to_string());
-        // e o JSON é o mesmo contrato
+        // and the JSON is the same contract
         let j = serde_json::to_value(&r).unwrap();
-        assert_eq!(j["verdict"], "critico");
+        assert_eq!(j["verdict"], "critical");
         assert_eq!(j["eligible"]["count"], 42);
     }
 }

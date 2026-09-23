@@ -10,11 +10,11 @@ use vassoura::{clean, config, daemon, disk, plan, statusfs, tools, walk};
 #[command(
     name = "vassoura",
     version,
-    about = "Coletor de build-lixo com marca d'água — o disco nunca enche",
+    about = "Watermarked build-artifact collector — the disk never fills up",
     long_about = None
 )]
 struct Cli {
-    /// Caminho do config (default ~/.vassoura/config.toml, criado se ausente)
+    /// Config path (default ~/.vassoura/config.toml, created if missing)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -23,64 +23,64 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Cataloga diretórios regeneráveis (tamanho + idade + classe)
+    /// Catalog regenerable directories (size + age + class)
     Scan {
-        /// Restringe o scan a este subdiretório
+        /// Restrict the scan to this subdirectory
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Quantidade de linhas na tabela
+        /// How many rows to print
         #[arg(long, default_value_t = 25)]
         top: usize,
-        /// Saída JSON (uma linha por candidato)
+        /// JSON output (one line per candidate)
         #[arg(long)]
         json: bool,
     },
-    /// Disco, marcas d'água e quanto dá pra recuperar agora
+    /// Disk, watermarks, and how much is reclaimable now
     Status {
         #[arg(long, default_value_t = 10)]
         top: usize,
-        /// Saída JSON (disco/marcas/veredito/elegível)
+        /// JSON output (disk / watermarks / verdict / eligible)
         #[arg(long)]
         json: bool,
     },
-    /// Plano de limpeza LRU até a meta de espaço livre (dry-run por default)
+    /// LRU cleanup plan up to the free-space target (dry-run by default)
     Clean {
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Executa de fato (default: só mostra o plano)
+        /// Actually delete (default: print the plan only)
         #[arg(long)]
         apply: bool,
-        /// Confirma sem perguntar (obrigatório se stdin não for terminal)
+        /// Skip the prompt (required when stdin is not a terminal)
         #[arg(long)]
         yes: bool,
-        /// Sobrepõe a idade mínima (dias) de todas as classes
-        #[arg(long, value_name = "DIAS")]
+        /// Override the minimum age (days) for every class
+        #[arg(long, value_name = "DAYS")]
         older_than: Option<u64>,
-        /// Meta de espaço livre em GiB
+        /// Free-space target in GiB
         #[arg(long, value_name = "GIB")]
         until_free: Option<f64>,
-        /// Máximo de itens no plano
+        /// Maximum items in the plan
         #[arg(long, default_value_t = 60)]
         top: usize,
     },
-    /// Loop com marca d'água: histerese low/high, evicção LRU bounded por ciclo
+    /// Watermark loop: low/high hysteresis, LRU eviction bounded per cycle
     Daemon {
-        /// Roda UM ciclo e sai (exercitável de fora)
+        /// Run ONE cycle and exit
         #[arg(long)]
         once: bool,
     },
-    /// Classes de ferramenta (ollama/docker/rustup/pnpm/go) — dry-run por default
+    /// Tool classes (ollama/docker/rustup/pnpm/go) — dry-run by default
     Tools {
-        /// Executa de fato via o CLI de cada ferramenta
+        /// Actually run each tool's own CLI
         #[arg(long)]
         apply: bool,
-        /// Confirma sem perguntar (obrigatório se stdin não for terminal)
+        /// Skip the prompt (required when stdin is not a terminal)
         #[arg(long)]
         yes: bool,
     },
-    /// Escreve o diretório de status (um arquivo por métrica) com os valores de `status`
+    /// Write the status directory (one file per metric) with the values of `status`
     Refresh,
-    /// Instala o LaunchAgent do daemon (escreve o plist; carregar é com o operador)
+    /// Install the daemon LaunchAgent (writes the plist; loading is up to you)
     InstallDaemon,
 }
 
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
     let (cfg, cfg_path) = match config::load(cli.config.as_deref()) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("erro: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -107,7 +107,7 @@ fn main() -> ExitCode {
     match r {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("erro: {e}");
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -134,7 +134,7 @@ fn cmd_scan(cfg: &config::Config, root: Option<&std::path::Path>, top: usize, js
     }
     let mut sorted = cands.clone();
     sorted.sort_by_key(|c| std::cmp::Reverse(c.bytes));
-    println!("{:<10} {:>7}  {:<9} {:<4} CAMINHO", "TAM", "IDADE(d)", "CLASSE", "GIT");
+    println!("{:<10} {:>7}  {:<9} {:<4} PATH", "SIZE", "AGE(d)", "CLASS", "GIT");
     for c in sorted.iter().take(top) {
         let age = fmt_util::age_days(std::time::SystemTime::now(), c.newest_mtime);
         println!(
@@ -142,14 +142,14 @@ fn cmd_scan(cfg: &config::Config, root: Option<&std::path::Path>, top: usize, js
             human(c.bytes),
             age,
             c.class.label(),
-            if c.contains_git { "SIM" } else { "" },
+            if c.contains_git { "YES" } else { "" },
             c.path.display()
         );
     }
     let total: u64 = cands.iter().map(|c| c.bytes).sum();
     let protected: u64 = cands.iter().filter(|c| c.contains_git).map(|c| c.bytes).sum();
     println!(
-        "\n{} candidatos, {} no total ({:.1} GiB); {:.1} GiB protegidos por .git interno",
+        "\n{} candidates, {} total ({:.1} GiB); {:.1} GiB protected by an inner .git",
         cands.len(),
         human(total),
         total as f64 / GIB as f64,
@@ -168,30 +168,30 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
     let report = statusfs::build_report(d, cfg, eligible, items.len());
 
     if json {
-        println!("{}", serde_json::to_string(&report).expect("status serializa"));
+        println!("{}", serde_json::to_string(&report).expect("status serializes"));
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!("disco: {} livres de {} ({:.0}% usado)", human(d.free), human(d.total), d.used() as f64 / d.total as f64 * 100.0);
+    println!("disk: {} free of {} ({:.0}% used)", human(d.free), human(d.total), d.used() as f64 / d.total as f64 * 100.0);
     println!(
-        "marcas d'água: baixa {} GiB (gatilho do daemon) · meta alta {} GiB",
+        "watermarks: low {} GiB (daemon trigger) · high target {} GiB",
         cfg.low_watermark_gib, cfg.until_free_gib
     );
-    let verdict = if d.free < low { "CRÍTICO — abaixo da marca baixa" } else if d.free < high { "APERTADO — cabe o plano do clean" } else { "OK — dentro da faixa" };
-    println!("estado: {verdict}");
+    let verdict = if d.free < low { "CRITICAL — below the low watermark" } else if d.free < high { "TIGHT — a clean plan fits" } else { "OK — inside the band" };
+    println!("state: {verdict}");
 
     let rej: u64 = rejected.iter().map(|r| r.bytes).sum();
     println!(
-        "\nregenerável elegível agora: {:.1} GiB · fora do plano (jovem/.git): {:.1} GiB",
+        "\nreclaimable now: {:.1} GiB · outside the plan (young / .git): {:.1} GiB",
         eligible as f64 / GIB as f64,
         rej as f64 / GIB as f64
     );
-    println!("faltam {} para a meta de {} GiB livres", human(report.need_bytes), cfg.until_free_gib);
+    println!("{} short of the {} GiB free target", human(report.need_bytes), cfg.until_free_gib);
 
     let mut by_age = items.clone();
     by_age.sort_by(|a, b| b.age_days.partial_cmp(&a.age_days).unwrap_or(std::cmp::Ordering::Equal));
-    println!("\nmais velhos primeiro (ordem de evicção):");
-    println!("{:<10} {:>7}  CAMINHO", "TAM", "IDADE(d)");
+    println!("\noldest first (eviction order):");
+    println!("{:<10} {:>7}  PATH", "SIZE", "AGE(d)");
     for i in by_age.iter().take(top) {
         println!("{:<10} {:>7.0}  {}", human(i.cand.bytes), i.age_days, i.cand.path.display());
     }
@@ -208,26 +208,28 @@ fn cmd_clean(
     until_free: Option<f64>,
     top: usize,
 ) -> Result<ExitCode, String> {
-    let d = disk_of(cfg);
     let until = until_free.unwrap_or(cfg.until_free_gib);
     let cands = walk::scan(cfg, root, false);
     let (items, rejected) = plan::build(cands, cfg, older_than);
+    // Re-stat after the scan: the plan uses free space now. The walk is long
+    // and the disk moves during it — the same bug as the daemon cycle.
+    let d = disk_of(cfg);
     let packed = plan::pack(items, d.free, until, top);
 
-    println!("plano de evicção (LRU: mais velho primeiro) — meta: {until} GiB livres");
-    println!("{:<10} {:>7}  {:<24} CAMINHO", "TAM", "IDADE(d)", "REGENERA");
+    println!("eviction plan (LRU: oldest first) — target: {until} GiB free");
+    println!("{:<10} {:>7}  {:<24} PATH", "SIZE", "AGE(d)", "REGEN");
     for i in &packed.items {
         println!("{:<10} {:>7.0}  {:<24} {}", human(i.cand.bytes), i.age_days, i.hint, i.cand.path.display());
     }
     if packed.items.is_empty() {
-        println!("(sem elegíveis: tudo jovem demais, protegido por .git, ou já na meta)");
+        println!("(nothing eligible: all too young, protected by .git, or already at the target)");
     }
     println!(
-        "\nitens: {} · seria liberado: {} · faltava p/ meta: {} · {}",
+        "\nitems: {} · would free: {} · short of target: {} · {}",
         packed.items.len(),
         human(packed.planned_bytes),
         human(packed.need_bytes),
-        if packed.reached { "meta atingível" } else { "meta NÃO atingível com estes itens/top" }
+        if packed.reached { "target reachable" } else { "target NOT reachable with these items/top" }
     );
 
     let mut rej_counts: std::collections::BTreeMap<String, (usize, u64)> = std::collections::BTreeMap::new();
@@ -238,11 +240,11 @@ fn cmd_clean(
         e.1 += r.bytes;
     }
     for (reason, (n, b)) in &rej_counts {
-        println!("fora do plano: {reason} — {n} dirs, {}", human(*b));
+        println!("outside the plan: {reason} — {n} dirs, {}", human(*b));
     }
 
     if !apply {
-        println!("\ndry-run (nada foi removido). Rode com --apply para executar.");
+        println!("\ndry-run (nothing removed). Run with --apply to execute.");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -252,18 +254,18 @@ fn cmd_clean(
 
     if !yes {
         if !std::io::stdin().is_terminal() {
-            return Err("stdin não é terminal: confirme com --yes (ou rode sem --apply para o dry-run)".into());
+            return Err("stdin is not a terminal: confirm with --yes (or run without --apply for the dry-run)".into());
         }
         print!(
-            "\nAplicar {} remoções liberando {}? [y/N] ",
+            "\nApply {} removals, freeing {}? [y/N] ",
             packed.items.len(),
             human(packed.planned_bytes)
         );
         let _ = std::io::stdout().flush();
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans).map_err(|e| e.to_string())?;
-        if !ans.trim().eq_ignore_ascii_case("y") && !ans.trim().eq_ignore_ascii_case("sim") {
-            println!("abortado — nada removido.");
+        if !ans.trim().eq_ignore_ascii_case("y") && !ans.trim().eq_ignore_ascii_case("yes") {
+            println!("aborted — nothing removed.");
             return Ok(ExitCode::SUCCESS);
         }
     }
@@ -271,14 +273,14 @@ fn cmd_clean(
     let out = clean::apply(&packed.items, &config::expand(&cfg.ledger));
     let after = disk_of(cfg);
     println!(
-        "\nremovidos: {} dirs · liberado: {} · livres agora: {} (era {})",
+        "\nremoved: {} dirs · freed: {} · free now: {} (was {})",
         out.removed,
         human(out.freed),
         human(after.free),
         human(d.free)
     );
     for (p, why) in &out.skipped {
-        println!("pulado: {} — {why}", p.display());
+        println!("skipped: {} — {why}", p.display());
     }
     println!("ledger: {}", cfg.ledger.display());
     Ok(ExitCode::SUCCESS)
@@ -300,27 +302,27 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
     let action = match rep.action.as_ref().unwrap_or(&daemon::CycleAction::Idle) {
         daemon::CycleAction::Idle => "IDLE".to_string(),
         daemon::CycleAction::Evict { need_bytes, .. } => {
-            format!("EVICT (precisa {})", human(*need_bytes))
+            format!("EVICT (needs {})", human(*need_bytes))
         }
     };
     println!(
-        "ciclo: {} candidatos · elegível {} · livres {} → {} · {}{}",
+        "cycle: {} candidates · eligible {} · free {} → {} · {}{}",
         rep.scanned,
         human(rep.eligible_bytes),
         human(rep.free_before),
         human(rep.free_after),
         action,
-        if rep.rate_limited { " [rate-limited: segura o ciclo]" } else { "" }
+        if rep.rate_limited { " [rate-limited: holding this cycle]" } else { "" }
     );
     if rep.removed > 0 {
         println!(
-            "  removidos: {} · liberado: {} · ledger: {}",
+            "  removed: {} · freed: {} · ledger: {}",
             rep.removed,
             human(rep.freed),
             config::expand(&cfg.ledger).display()
         );
         for (p, why) in &rep.skipped {
-            println!("  pulado: {} — {why}", p.display());
+            println!("  skipped: {} — {why}", p.display());
         }
     }
 }
@@ -330,18 +332,18 @@ fn cmd_tools(cfg: &config::Config, apply: bool, yes: bool) -> Result<ExitCode, S
     let bins = tools::Bins::default();
     let plans = tools::gather(cfg, &bins, d.free);
 
-    println!("classes de ferramenta — meta: {} GiB livres (livres agora: {})", cfg.until_free_gib, human(d.free));
+    println!("tool classes — target: {} GiB free (free now: {})", cfg.until_free_gib, human(d.free));
     let mut any = false;
     for p in &plans {
         match &p.outcome {
-            tools::ToolPlanOutcome::Disabled => println!("{:<8} desligada no config", p.tool),
-            tools::ToolPlanOutcome::AtTarget => println!("{:<8} na meta — nada a fazer", p.tool),
-            tools::ToolPlanOutcome::Missing => println!("{:<8} PULADA: ferramenta ausente (fail-closed)", p.tool),
-            tools::ToolPlanOutcome::Failed(e) => println!("{:<8} PULADA: {e}", p.tool),
+            tools::ToolPlanOutcome::Disabled => println!("{:<8} disabled in config", p.tool),
+            tools::ToolPlanOutcome::AtTarget => println!("{:<8} at target — nothing to do", p.tool),
+            tools::ToolPlanOutcome::Missing => println!("{:<8} SKIPPED: tool missing (fail-closed)", p.tool),
+            tools::ToolPlanOutcome::Failed(e) => println!("{:<8} SKIPPED: {e}", p.tool),
             tools::ToolPlanOutcome::Plan(actions) => {
                 any = true;
                 if actions.is_empty() {
-                    println!("{:<8} plano vazio (nada velho/supérfluo)", p.tool);
+                    println!("{:<8} empty plan (nothing old or redundant)", p.tool);
                     continue;
                 }
                 for a in actions {
@@ -353,7 +355,7 @@ fn cmd_tools(cfg: &config::Config, apply: bool, yes: bool) -> Result<ExitCode, S
 
     if !apply {
         if any {
-            println!("\ndry-run (nada foi removido). Rode com --apply para executar.");
+            println!("\ndry-run (nothing removed). Run with --apply to execute.");
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -370,14 +372,14 @@ fn cmd_tools(cfg: &config::Config, apply: bool, yes: bool) -> Result<ExitCode, S
     }
     if !yes {
         if !std::io::stdin().is_terminal() {
-            return Err("stdin não é terminal: confirme com --yes (ou rode sem --apply para o dry-run)".into());
+            return Err("stdin is not a terminal: confirm with --yes (or run without --apply for the dry-run)".into());
         }
-        print!("\nAplicar {planned_total} ações de ferramenta? [y/N] ");
+        print!("\nApply {planned_total} tool actions? [y/N] ");
         let _ = std::io::stdout().flush();
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans).map_err(|e| e.to_string())?;
-        if !ans.trim().eq_ignore_ascii_case("y") && !ans.trim().eq_ignore_ascii_case("sim") {
-            println!("abortado — nada removido.");
+        if !ans.trim().eq_ignore_ascii_case("y") && !ans.trim().eq_ignore_ascii_case("yes") {
+            println!("aborted — nothing removed.");
             return Ok(ExitCode::SUCCESS);
         }
     }
@@ -385,10 +387,10 @@ fn cmd_tools(cfg: &config::Config, apply: bool, yes: bool) -> Result<ExitCode, S
     let outs = tools::execute(&plans, &bins, &config::expand(&cfg.ledger));
     for o in &outs {
         match &o.status {
-            tools::RunStatus::Missing => println!("pulado: {} — ferramenta ausente (fail-closed)", o.subject),
-            tools::RunStatus::Failed(e) => println!("FALHOU: {} — {e}", o.subject),
+            tools::RunStatus::Missing => println!("skipped: {} — tool missing (fail-closed)", o.subject),
+            tools::RunStatus::Failed(e) => println!("FAILED: {} — {e}", o.subject),
             tools::RunStatus::Ran { reclaimed_bytes } => {
-                println!("ok: {} — confirmado {}", o.subject, human(*reclaimed_bytes))
+                println!("ok: {} — confirmed {}", o.subject, human(*reclaimed_bytes))
             }
         }
     }
@@ -405,7 +407,7 @@ fn cmd_refresh(cfg: &config::Config) -> Result<ExitCode, String> {
     let dir = config::expand(&cfg.status_dir);
     let written = statusfs::write_status_dir(&dir, &report).map_err(|e| e.to_string())?;
     println!(
-        "{} arquivos em {} · veredito {} · elegível {} · livres {}",
+        "{} files in {} · verdict {} · eligible {} · free {}",
         written.len(),
         dir.display(),
         report.verdict,
@@ -418,11 +420,11 @@ fn cmd_refresh(cfg: &config::Config) -> Result<ExitCode, String> {
 fn cmd_install_daemon(cfg: &config::Config, cfg_path: &Path) -> Result<ExitCode, String> {
     let bin = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let path = vassoura::launchd::install(&bin, cfg_path, cfg.watch_interval_secs)?;
-    println!("plist escrito: {}", path.display());
+    println!("plist written: {}", path.display());
     println!(
-        "para carregar (decisão do operador):\n  launchctl load {}",
+        "to load (your decision):\n  launchctl load {}",
         path.display()
     );
-    println!("para descarregar:\n  launchctl unload {}", path.display());
+    println!("to unload:\n  launchctl unload {}", path.display());
     Ok(ExitCode::SUCCESS)
 }

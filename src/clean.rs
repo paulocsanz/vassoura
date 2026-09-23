@@ -11,19 +11,19 @@ pub struct Outcome {
     pub skipped: Vec<(std::path::PathBuf, String)>,
 }
 
-/// Executa o plano com os gates do último instante (produção: lsof + git,
+/// Run the plan with last-instant gates (production: lsof + git,
 /// fail-closed — P1.2):
-/// 1. o candidato não está em uso (arquivo aberto por processo vivo /
-///    worktree com trabalho não-commitado) — gates indisponíveis pulam;
-/// 2. o caminho ainda existe e ainda é diretório (sem symlink);
-/// 3. o mtime da raiz é exatamente o do scan — se algo escreveu lá
-///    dentro depois do scan, a evicção é abortada para aquele item;
-/// 4. toda remoção bem-sucedida nasce com linha no ledger.
+/// 1. the candidate is not in use (file open by a live process /
+///    worktree with uncommitted work) — unavailable gates skip;
+/// 2. the path still exists and is still a directory (not a symlink);
+/// 3. the root mtime is exactly the scan's — if something wrote inside
+///    after the scan, eviction is aborted for that item;
+/// 4. every successful removal is born with a ledger line.
 pub fn apply(items: &[PlanItem], ledger_path: &Path) -> Outcome {
     apply_with(items, ledger_path, &crate::gates::in_use)
 }
 
-/// `apply` com predicado de uso injetável (testes determinísticos).
+/// `apply` with an injectable in-use predicate (deterministic tests).
 pub fn apply_with(
     items: &[PlanItem],
     ledger_path: &Path,
@@ -37,15 +37,15 @@ pub fn apply_with(
             continue;
         }
         let Ok(md) = fs::symlink_metadata(path) else {
-            out.skipped.push((path.clone(), "sumiu desde o scan".into()));
+            out.skipped.push((path.clone(), "gone since the scan".into()));
             continue;
         };
         if md.is_symlink() || !md.is_dir() {
-            out.skipped.push((path.clone(), "não é mais um diretório comum".into()));
+            out.skipped.push((path.clone(), "no longer a regular directory".into()));
             continue;
         }
-        if md.modified().ok() != Some(it.cand.newest_mtime) {
-            out.skipped.push((path.clone(), "mudou desde o scan (protegido)".into()));
+        if md.modified().ok() != Some(it.cand.root_mtime) {
+            out.skipped.push((path.clone(), "changed since the scan (kept)".into()));
             continue;
         }
         match fs::remove_dir_all(path) {
@@ -61,15 +61,15 @@ pub fn apply_with(
                     hint: it.hint.clone(),
                 };
                 if let Err(e) = ledger::append(ledger_path, &line) {
-                    // remoção sem ledger viola a recusa "nada-sem-ledger":
-                    // o diretório já saiu; registramos o erro no stderr.
-                    eprintln!("# ERRO ledger {}: {e} (item removido: {})", ledger_path.display(), path.display());
+                    // a removal without a ledger violates the "nothing-without-ledger" refusal:
+                    // the directory is already gone; we record the error on stderr.
+                    eprintln!("# LEDGER ERROR {}: {e} (item already removed: {})", ledger_path.display(), path.display());
                 }
                 out.freed += it.cand.bytes;
                 out.removed += 1;
             }
             Err(e) => {
-                out.skipped.push((path.clone(), format!("rm falhou: {e}")));
+                out.skipped.push((path.clone(), format!("rm failed: {e}")));
             }
         }
     }
@@ -89,6 +89,7 @@ mod tests {
                 class: Class::Artifact,
                 bytes,
                 newest_mtime: newest,
+                root_mtime: newest,
                 contains_git: false,
                 entries: 1,
             },
@@ -108,12 +109,12 @@ mod tests {
             fs::create_dir_all(d).unwrap();
             fs::write(d.join("f.bin"), vec![0u8; 128]).unwrap();
         }
-        // simula idades
+        // simulate ages
         filetime::set_file_times(&a, old_mtime.into(), old_mtime.into()).unwrap();
         filetime::set_file_times(&b, old_mtime.into(), old_mtime.into()).unwrap();
 
         let ledger = tmp.path().join("ledger.jsonl");
-        // item `b` foi tocado depois do scan (mtime diverge)
+        // item `b` was touched after the scan (mtime diverged)
         let stale_b = SystemTime::now() - Duration::from_secs(60);
         let items = vec![
             item(&a, 200, 30, old_mtime),
@@ -123,9 +124,9 @@ mod tests {
         let out = apply_with(&items, &ledger, &noop);
 
         assert_eq!(out.removed, 1);
-        assert!(out.skipped.iter().any(|(p, _)| p == &b), "b precisa ser protegido");
+        assert!(out.skipped.iter().any(|(p, _)| p == &b), "b must be protected");
         assert!(!a.exists());
-        assert!(b.exists(), "b não pode ser removido");
+        assert!(b.exists(), "b must not be removed");
         let txt = fs::read_to_string(&ledger).unwrap();
         let lines: Vec<&str> = txt.lines().collect();
         assert_eq!(lines.len(), 1);
@@ -146,14 +147,50 @@ mod tests {
         let ledger = tmp.path().join("ledger.jsonl");
 
         let gate = |p: &std::path::Path| {
-            (p == &a).then(|| "em uso: processo com arquivo aberto".to_string())
+            (p == &a).then(|| "in use: process has a file open".to_string())
         };
         let out = apply_with(std::slice::from_ref(&it), &ledger, &gate);
 
         assert_eq!(out.removed, 0);
         assert_eq!(out.skipped.len(), 1);
-        assert!(out.skipped[0].1.contains("em uso"), "{:?}", out.skipped[0]);
-        assert!(a.exists(), "em uso não é removido");
-        assert!(!ledger.exists(), "sem remoção não nasce linha no ledger");
+        assert!(out.skipped[0].1.contains("in use"), "{:?}", out.skipped[0]);
+        assert!(a.exists(), "in use is not removed");
+        assert!(!ledger.exists(), "no removal means no ledger line");
+    }
+
+    #[test]
+    fn inner_file_newer_than_the_root_is_still_removed() {
+        // The scan stores the newest mtime in the tree (age) and the root mtime
+        // (re-stat). An inner file newer than the root is not "changed
+        // since the scan" — nothing was written between the scan and removal.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let nm = proj.join("node_modules");
+        fs::create_dir_all(nm.join("dep")).unwrap();
+        fs::write(proj.join("package.json"), "{}").unwrap();
+        fs::write(nm.join("dep/a.js"), "x").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(40 * 86400);
+        let newer = SystemTime::now() - Duration::from_secs(20 * 86400);
+        filetime::set_file_times(&nm, old.into(), old.into()).unwrap();
+        filetime::set_file_times(nm.join("dep"), newer.into(), newer.into()).unwrap();
+        filetime::set_file_times(nm.join("dep/a.js"), newer.into(), newer.into()).unwrap();
+
+        let cfg = crate::config::Config {
+            artifact_roots: vec![tmp.path().to_path_buf()],
+            artifact_names: vec!["node_modules".into()],
+            min_age_days_artifacts: 14,
+            app_cache_roots: vec![],
+            ..crate::config::Config::default()
+        };
+        let cands = crate::walk::scan(&cfg, None, true);
+        assert_eq!(cands.len(), 1);
+        assert!(cands[0].newest_mtime > cands[0].root_mtime, "inner file is newer than the root");
+        let (items, _) = crate::plan::build(cands, &cfg, None);
+        assert_eq!(items.len(), 1);
+        let ledger = tmp.path().join("ledger.jsonl");
+        let out = apply_with(&items, &ledger, &|_| None);
+        assert_eq!(out.removed, 1, "root re-stat must not refuse: {:?}", out.skipped);
+        assert!(!nm.exists());
+        assert!(ledger.exists());
     }
 }

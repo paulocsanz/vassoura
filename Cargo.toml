@@ -2,7 +2,7 @@
 name = "vassoura"
 version = "0.1.0"
 edition = "2021"
-description = "Coletor de build-lixo com marca d'água: evicta o regenerável menos usado antes do disco encher, com ledger auditável"
+description = "Watermarked build-artifact collector: evicts the least-recently-used regenerable directory before the disk fills, with an auditable ledger"
 license = "MIT"
 
 [dependencies]

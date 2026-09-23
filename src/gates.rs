@@ -1,7 +1,7 @@
-//! Gates de uso (P1.2): um candidato só é removido se NENHUM processo vivo
-//! tiver arquivo aberto sob ele (lsof real) e a worktree git que o contém
-//! estiver limpa. Gates ausentes/indisponíveis falham FECHADO: o candidato
-//! é pulado, nunca removido às cegas.
+//! Use gates (P1.2): a candidate is removed only if NO live process has a
+//! file open under it (real lsof) and the git worktree that contains it is
+//! clean. A missing or unavailable gate fails CLOSED: the candidate is
+//! skipped, never removed blindly.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -9,11 +9,11 @@ use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UseState {
-    /// Nada em uso: candidato segue elegível.
+    /// Nothing in use: the candidate stays eligible.
     Free,
-    /// Em uso (motivo legível): pular.
+    /// In use (human-readable reason): skip.
     InUse(String),
-    /// Gate indisponível (binário ausente/erro): fail-closed → pular.
+    /// Gate unavailable (missing binary/error): fail-closed → skip.
     Unavailable(String),
 }
 
@@ -22,30 +22,30 @@ fn lsof_probe(args: &[&OsStr]) -> Result<bool, String> {
         .args(args)
         .output()
         .map_err(|e| format!("spawn lsof: {e}"))?;
-    // O exit code do lsof varia (1 mesmo com achados); o sinal é o stdout
-    // (-F p imprime uma linha "p<pid>" por processo).
+    // lsof's exit code varies (1 even when it found something); the signal is stdout
+    // (-F p prints one "p<pid>" line per process).
     Ok(!out.stdout.is_empty())
 }
 
-/// lsof real: processo vivo com arquivo aberto SOB o diretório (+D,
-/// recursivo) ou com o próprio diretório aberto (cwd/fd).
+/// Real lsof: a live process with a file open UNDER the directory (+D,
+/// recursive) or with the directory itself open (cwd/fd).
 pub fn lsof_state(path: &Path) -> UseState {
     let p = path.as_os_str();
     let under = ["-w", "-F", "p", "+D"].iter().map(|s| OsStr::new(*s)).chain(std::iter::once(p));
     match lsof_probe(&under.collect::<Vec<_>>()) {
-        Ok(true) => return UseState::InUse("processo com arquivo aberto (lsof +D)".into()),
+        Ok(true) => return UseState::InUse("process has a file open (lsof +D)".into()),
         Err(e) => return UseState::Unavailable(e),
         Ok(false) => {}
     }
     let itself = ["-w", "-F", "p", "--"].iter().map(|s| OsStr::new(*s)).chain(std::iter::once(p));
     match lsof_probe(&itself.collect::<Vec<_>>()) {
-        Ok(true) => UseState::InUse("processo com o diretório aberto (lsof cwd/fd)".into()),
+        Ok(true) => UseState::InUse("process has the directory open (lsof cwd/fd)".into()),
         Err(e) => UseState::Unavailable(e),
         Ok(false) => UseState::Free,
     }
 }
 
-/// Repo git mais próximo acima do candidato (dir OU arquivo — worktree).
+/// Nearest git repo above the candidate (dir OR file — the worktree).
 pub fn nearest_repo(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .skip(1)
@@ -53,8 +53,8 @@ pub fn nearest_repo(path: &Path) -> Option<PathBuf> {
         .map(|a| a.to_path_buf())
 }
 
-/// git real: candidato dentro de worktree com trabalho não-commitado → pulado.
-/// Worktree limpa (ou nem-repo) segue elegível.
+/// Real git: a candidate inside a worktree with uncommitted work → skipped.
+/// A clean worktree (or not a repo) stays eligible.
 pub fn git_state(path: &Path) -> UseState {
     let Some(repo) = nearest_repo(path) else {
         return UseState::Free;
@@ -70,7 +70,7 @@ pub fn git_state(path: &Path) -> UseState {
         Ok(o) => {
             let dirty = !String::from_utf8_lossy(&o.stdout).trim().is_empty();
             if dirty {
-                UseState::InUse(format!("worktree com trabalho não-commitado ({})", repo.display()))
+                UseState::InUse(format!("worktree has uncommitted work ({})", repo.display()))
             } else {
                 UseState::Free
             }
@@ -82,15 +82,15 @@ fn skip_of(state: UseState, gate: &str) -> Option<String> {
     match state {
         UseState::Free => None,
         UseState::InUse(why) => Some(format!("{gate}: {why}")),
-        UseState::Unavailable(e) => Some(format!("{gate} indisponível (fail-closed): {e}")),
+        UseState::Unavailable(e) => Some(format!("{gate} unavailable (fail-closed): {e}")),
     }
 }
 
-/// Gate de produção usado por `clean --apply` e pelo daemon:
-/// `Some(motivo)` = pular (sem remoção, sem ledger).
+/// Production gate used by `clean --apply` and the daemon:
+/// `Some(reason)` = skip (no removal, no ledger).
 pub fn in_use(path: &Path) -> Option<String> {
-    skip_of(lsof_state(path), "em uso")
-        .or_else(|| skip_of(git_state(path), "em uso"))
+    skip_of(lsof_state(path), "in use")
+        .or_else(|| skip_of(git_state(path), "in use"))
 }
 
 #[cfg(test)]
@@ -117,12 +117,12 @@ mod tests {
                 f.display().to_string()
             ))
             .spawn()
-            .expect("python3 para segurar arquivo");
+            .expect("python3 to hold a file open");
         std::thread::sleep(std::time::Duration::from_millis(800));
         let st = lsof_state(tmp.path());
         let _ = hold.kill();
         let _ = hold.wait();
-        assert!(matches!(st, UseState::InUse(_)), "esperava InUse, veio {st:?}");
+        assert!(matches!(st, UseState::InUse(_)), "expected InUse, got {st:?}");
     }
 
     #[test]
@@ -130,7 +130,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cand = tmp.path().join("node_modules");
         std::fs::create_dir_all(&cand).unwrap();
-        assert_eq!(git_state(&cand), UseState::Free, "sem repo → elegível");
+        assert_eq!(git_state(&cand), UseState::Free, "no repo → eligible");
 
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -146,19 +146,19 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), b"{}").unwrap();
         assert!(
             matches!(git_state(&cand), UseState::InUse(_)),
-            "não-commitado → pulado"
+            "uncommitted → skipped"
         );
         git(&["add", "."]);
         git(&["commit", "-qm", "x"]);
-        assert_eq!(git_state(&cand), UseState::Free, "limpa → elegível");
+        assert_eq!(git_state(&cand), UseState::Free, "clean → eligible");
     }
 
     #[test]
     fn unavailable_gate_fails_closed_in_combined() {
-        // A falha fechada em produção é a composição em `in_use`; aqui o
-        // mapeamento Unavailable → pulado é verificado direto.
-        let why = skip_of(UseState::Unavailable("boom".into()), "em uso").unwrap();
+        // The production fail-closed path is the composition in `in_use`; here the
+        // Unavailable → skipped mapping is checked directly.
+        let why = skip_of(UseState::Unavailable("boom".into()), "in use").unwrap();
         assert!(why.contains("fail-closed"), "{why}");
-        assert!(skip_of(UseState::Free, "em uso").is_none());
+        assert!(skip_of(UseState::Free, "in use").is_none());
     }
 }

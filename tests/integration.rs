@@ -1,4 +1,4 @@
-//! E2E pela biblioteca: scan → plan → clean numa árvore falsa, com config real.
+//! E2E through the library: scan → plan → clean on a fake tree, with a real config.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,7 +23,7 @@ fn scan_plan_clean_end_to_end() {
     let root = tmp.path().join("projetos");
     let fake_home = tmp.path().to_path_buf();
 
-    // projeto velho: node_modules de 40 dias, lockfile pnpm
+    // old project: node_modules of 40 days, pnpm lockfile
     mkfile(&root.join("velho/package.json"), 20);
     mkfile(&root.join("velho/pnpm-lock.yaml"), 20);
     mkfile(&root.join("velho/node_modules/dep/a.js"), 1000);
@@ -32,7 +32,7 @@ fn scan_plan_clean_end_to_end() {
     age_dir(&root.join("velho/node_modules"), 40);
     age_dir(&root.join("velho"), 40);
 
-    // projeto novo: target de 2 dias (protegido pela idade)
+    // new project: target of 2 days (protected by age)
     mkfile(&root.join("novo/Cargo.toml"), 10);
     mkfile(&root.join("novo/target/debug/app"), 2000);
     age_dir(&root.join("novo/target/debug/app"), 2);
@@ -44,25 +44,25 @@ fn scan_plan_clean_end_to_end() {
         ledger: fake_home.join("ledger.jsonl"),
         artifact_roots: vec![root.clone()],
         app_cache_roots: vec![fake_home.join("Caches")],
-        until_free_gib: 0.0, // meta 0 → need 0 → plan pack pega o que houver
+        until_free_gib: 0.0, // target 0 → need 0 → plan pack takes whatever there is
         ..Config::default()
     };
 
     let cands = vassoura::walk::scan(&cfg, Some(&root), true);
-    assert_eq!(cands.len(), 2, "node_modules velho + target novo: {cands:?}");
+    assert_eq!(cands.len(), 2, "old node_modules + new target: {cands:?}");
 
     let (items, rejected) = vassoura::plan::build(cands, &cfg, None);
-    assert_eq!(items.len(), 1, "target novo é jovem: {items:?}");
-    assert!(rejected.iter().any(|r| r.reason.contains("jovem")));
+    assert_eq!(items.len(), 1, "new target is young: {items:?}");
+    assert!(rejected.iter().any(|r| r.reason.contains("young")));
     assert_eq!(items[0].hint, "pnpm install");
 
-    // mtime guarda: escrever dentro depois do scan torna o diretório "fresco"
+    // mtime guard: writing inside after the scan makes the directory "fresh"
     std::fs::write(root.join("velho/node_modules/dep/novo.js"), b"y").unwrap();
     let cands2 = vassoura::walk::scan(&cfg, Some(&root), true);
     let (items2, _) = vassoura::plan::build(cands2, &cfg, None);
-    assert!(items2.is_empty(), "tocou dentro → jovem demais → fora do plano");
+    assert!(items2.is_empty(), "wrote inside → too young → out of the plan");
 
-    // volta o mtime velho (arquivo E diretórios-pai que a escrita tocou)
+    // restore the old mtime (the file AND parent dirs the write touched)
     age_dir(&root.join("velho/node_modules/dep/novo.js"), 40);
     age_dir(&root.join("velho/node_modules/dep"), 40);
     age_dir(&root.join("velho/node_modules"), 40);
@@ -71,7 +71,7 @@ fn scan_plan_clean_end_to_end() {
     let out = vassoura::clean::apply(&items3, &cfg.ledger);
     assert_eq!(out.removed, 1);
     assert!(!root.join("velho/node_modules").exists());
-    assert!(root.join("novo/target").exists(), "o jovem fica");
+    assert!(root.join("novo/target").exists(), "the young one stays");
     let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
     assert_eq!(ledger.lines().count(), 1);
     assert!(ledger.contains("pnpm install"));
@@ -97,11 +97,11 @@ fn app_cache_children_are_cataloged() {
     assert_eq!(cands[0].class, Class::AppCache);
 
     let (items, rejected) = vassoura::plan::build(cands, &cfg, None);
-    assert_eq!(items.len(), 1, "90d > 30d de min de app-cache: {rejected:?}");
+    assert_eq!(items.len(), 1, "90d > 30d app-cache minimum: {rejected:?}");
 }
 
 // ---------------------------------------------------------------- P1.2
-// Gates de uso ao vivo no caminho REAL de clean (produção: lsof + git).
+// Live use gates on the REAL clean path (production: lsof + git).
 
 fn git(tmp: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
@@ -137,7 +137,7 @@ fn clean_skips_dir_with_open_file_and_no_ledger_line() {
     let cfg = sandbox_cfg(root.clone(), home.clone());
     let _ = std::fs::create_dir_all(&home);
 
-    // processo REAL segurando arquivo aberto dentro do candidato
+    // REAL process holding a file open inside the candidate
     let mut hold = std::process::Command::new("python3")
         .arg("-c")
         .arg(format!(
@@ -151,17 +151,17 @@ fn clean_skips_dir_with_open_file_and_no_ledger_line() {
     let cands = vassoura::walk::scan(&cfg, Some(&root), true);
     let (items, _) = vassoura::plan::build(cands, &cfg, None);
     assert_eq!(items.len(), 1);
-    let out = vassoura::clean::apply(&items, &cfg.ledger); // gates de produção
+    let out = vassoura::clean::apply(&items, &cfg.ledger); // production gates
 
     let _ = hold.kill();
     let _ = hold.wait();
 
-    assert_eq!(out.removed, 0, "dir com arquivo aberto não sai");
-    assert!(nm.exists(), "dir com arquivo aberto continua existindo");
+    assert_eq!(out.removed, 0, "dir with an open file does not leave");
+    assert!(nm.exists(), "dir with an open file still exists");
     let skipped_reason = out.skipped.iter().map(|(_, w)| w.clone()).collect::<Vec<_>>().join("; ");
-    assert!(skipped_reason.contains("em uso"), "{skipped_reason}");
+    assert!(skipped_reason.contains("in use"), "{skipped_reason}");
     assert!(!cfg.ledger.exists() || std::fs::read_to_string(&cfg.ledger).unwrap().trim().is_empty(),
-        "sem remoção → sem linha de ledger");
+        "no removal → no ledger line");
 }
 
 #[test]
@@ -185,29 +185,29 @@ fn clean_skips_dirty_worktree_but_clean_worktree_is_eligible() {
     git(&project, &["add", ".gitignore", "package.json"]);
     git(&project, &["commit", "-qm", "init"]);
 
-    // trabalho não-commitado: pula
+    // uncommitted work: skip
     std::fs::write(project.join("wip.txt"), b"trabalho").unwrap();
     let cands = vassoura::walk::scan(&cfg, Some(&root), true);
     let (items, _) = vassoura::plan::build(cands, &cfg, None);
     let out = vassoura::clean::apply(&items, &cfg.ledger);
-    assert_eq!(out.removed, 0, "worktree suja é pulada");
+    assert_eq!(out.removed, 0, "dirty worktree is skipped");
     assert!(project.join("node_modules").exists());
-    assert!(out.skipped.iter().any(|(_, w)| w.contains("não-commitado")), "{:?}", out.skipped);
+    assert!(out.skipped.iter().any(|(_, w)| w.contains("uncommitted")), "{:?}", out.skipped);
 
-    // commitou: elegível de novo
+    // committed: eligible again
     git(&project, &["add", "wip.txt"]);
     git(&project, &["commit", "-qm", "wip"]);
     let cands = vassoura::walk::scan(&cfg, Some(&root), true);
     let (items, _) = vassoura::plan::build(cands, &cfg, None);
     let out = vassoura::clean::apply(&items, &cfg.ledger);
-    assert_eq!(out.removed, 1, "worktree limpa segue elegível");
+    assert_eq!(out.removed, 1, "clean worktree stays eligible");
     assert!(!project.join("node_modules").exists());
     let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
     assert_eq!(ledger.lines().count(), 1);
 }
 
 // ---------------------------------------------------------------- P1.1
-// Ciclo do daemon na árvore falsa: gatilho (marcas impossíveis) e idle.
+// Daemon cycle on the fake tree: trigger (impossible marks) and idle.
 
 fn daemon_tree(root: &Path) {
     for (name, days) in [("velho1", 40), ("velho2", 35), ("velho3", 30)] {
@@ -237,11 +237,11 @@ fn daemon_cycle_triggers_bounded_and_ledgers_each_removal() {
     daemon_tree(&root);
 
     let cfg = Config {
-        low_watermark_gib: 1_000_000.0,   // baixa gigante: livre < baixa SEMPRE
-        until_free_gib: 2_000_000.0,      // meta inalcançável: bound esgota o ciclo
+        low_watermark_gib: 1_000_000.0,   // huge low mark: free < low ALWAYS
+        until_free_gib: 2_000_000.0,      // unreachable target: the bound exhausts the cycle
         daemon: vassoura::config::DaemonCfg {
-            max_items_per_cycle: 2,       // bound de itens
-            notify: false,                // teste não dispara notificação real
+            max_items_per_cycle: 2,       // item bound
+            notify: false,                // test does not fire a real notification
             ..vassoura::config::DaemonCfg::default()
         },
         ..sandbox_cfg(root.clone(), home.clone())
@@ -249,26 +249,70 @@ fn daemon_cycle_triggers_bounded_and_ledgers_each_removal() {
 
     let rep = vassoura::daemon::run_cycle(&cfg);
 
-    assert_eq!(rep.removed, 2, "bound de 2 itens por ciclo: {:?}", rep.skipped);
+    assert_eq!(rep.removed, 2, "bound of 2 items per cycle: {:?}", rep.skipped);
     assert!(matches!(rep.action, Some(vassoura::daemon::CycleAction::Evict { .. })));
-    assert!(!root.join("velho1/node_modules").exists(), "mais velho sai primeiro");
+    assert!(!root.join("velho1/node_modules").exists(), "oldest leaves first");
     assert!(!root.join("velho2/node_modules").exists());
-    assert!(root.join("velho3/node_modules").exists(), "3º velho fica para o próximo ciclo");
-    assert!(root.join("novo/target").exists(), "jovem é protegido pela idade");
+    assert!(root.join("velho3/node_modules").exists(), "3rd oldest stays for the next cycle");
+    assert!(root.join("novo/target").exists(), "young one is protected by age");
     let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
-    assert_eq!(ledger.lines().count(), 2, "uma linha por remoção");
+    assert_eq!(ledger.lines().count(), 2, "one line per removal");
     for l in ledger.lines() {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
-        assert!(v["hint"].as_str().unwrap().contains("install"), "dica de regeneração: {}", v["hint"]);
+        assert!(v["hint"].as_str().unwrap().contains("install"), "regeneration hint: {}", v["hint"]);
     }
 
-    // segundo ciclo imediato: rate-limit segura (default 900s)
+    // immediate second cycle: rate-limit holds (default 900s)
     let cfg2 = Config { low_watermark_gib: 1_000_000.0, until_free_gib: 2_000_000.0, ..cfg.clone() };
     let rep2 = vassoura::daemon::run_cycle(&cfg2);
-    assert!(rep2.rate_limited, "evicção há segundos → rate-limited");
+    assert!(rep2.rate_limited, "eviction seconds ago → rate-limited");
     assert_eq!(rep2.removed, 0);
     let ledger2 = std::fs::read_to_string(&cfg2.ledger).unwrap();
-    assert_eq!(ledger2.lines().count(), 2, "idle não acrescenta ledger");
+    assert_eq!(ledger2.lines().count(), 2, "idle does not append to the ledger");
+}
+
+#[test]
+fn daemon_decides_on_free_space_measured_after_the_scan() {
+    // The scan takes minutes on the real working set and free space drops in
+    // the middle. The stat at the START (here 50 GiB, above the mark of 40)
+    // must not decide: the stat at the END (10 GiB) is the one that counts,
+    // and the cycle has to evict.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    daemon_tree(&root);
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 30,
+            max_bytes_per_cycle_gib: 20.0,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let calls = std::cell::Cell::new(0u32);
+    let gib = 1024u64 * 1024 * 1024;
+    let rep = vassoura::daemon::run_cycle_sampling(&cfg, || {
+        let n = calls.get();
+        calls.set(n + 1);
+        // 1st sample = start of the cycle (comfortable); the rest = after the scan
+        let free = if n == 0 { 50 * gib } else { 10 * gib };
+        vassoura::disk::Disk { total: 200 * gib, free }
+    });
+
+    assert!(
+        matches!(rep.action, Some(vassoura::daemon::CycleAction::Evict { .. })),
+        "free space fell below the mark during the scan: must evict, not idle: {:?}",
+        rep.action
+    );
+    assert!(rep.removed >= 1, "old candidate leaves when free space at the end of the scan is critical");
+    assert!(!root.join("velho1/node_modules").exists());
+    assert!(cfg.ledger.exists(), "removal writes the ledger");
 }
 
 #[test]
@@ -280,7 +324,7 @@ fn daemon_cycle_idle_between_marks_removes_nothing() {
     daemon_tree(&root);
 
     let cfg = Config {
-        low_watermark_gib: 0.000001, // baixa ~0: livre ≥ baixa sempre → IDLE
+        low_watermark_gib: 0.000001, // low ~0: free ≥ low always → IDLE
         daemon: vassoura::config::DaemonCfg { notify: false, ..vassoura::config::DaemonCfg::default() },
         ..sandbox_cfg(root.clone(), home.clone())
     };
@@ -288,16 +332,16 @@ fn daemon_cycle_idle_between_marks_removes_nothing() {
 
     assert_eq!(rep.action, Some(vassoura::daemon::CycleAction::Idle));
     assert_eq!(rep.removed, 0);
-    assert!(!cfg.ledger.exists(), "idle: nada no ledger");
-    // mesmo assim o statusfs e o seen.db são refreshados
-    assert!(cfg.status_dir.join("verdict.txt").exists(), "ciclo alimenta o fs de status");
-    assert!(cfg.seen_db.exists(), "ciclo persiste o seen.db");
+    assert!(!cfg.ledger.exists(), "idle: nothing in the ledger");
+    // even so, statusfs and seen.db are refreshed
+    assert!(cfg.status_dir.join("verdict.txt").exists(), "cycle feeds the status fs");
+    assert!(cfg.seen_db.exists(), "cycle persists seen.db");
     let seen = std::fs::read_to_string(&cfg.seen_db).unwrap();
-    assert!(seen.contains("velho1/node_modules"), "seen.db registra candidatos: {seen}");
+    assert!(seen.contains("velho1/node_modules"), "seen.db records candidates: {seen}");
 }
 
 // ---------------------------------------------------------------- P2.1/P2.2
-// seen.db alimenta o LRU; statusfs bate com status --json (mesma construção).
+// seen.db feeds the LRU; statusfs matches status --json (same construction).
 
 #[test]
 fn seen_ordering_drives_daemon_lru() {
@@ -306,7 +350,7 @@ fn seen_ordering_drives_daemon_lru() {
     std::fs::create_dir_all(&home).unwrap();
     let root = tmp.path().join("projetos");
 
-    // dois candidatos com mtime equivalente (40d)
+    // two candidates with equivalent mtime (40d)
     for name in ["aa", "bb"] {
         let proj = root.join(name);
         mkfile(&proj.join("package.json"), 20);
@@ -319,7 +363,7 @@ fn seen_ordering_drives_daemon_lru() {
     }
     let cfg = sandbox_cfg(root.clone(), home.clone());
 
-    // ciclo 1 (idle): ambos nascem no seen com last_seen = mtime
+    // cycle 1 (idle): both are born in seen with last_seen = mtime
     let cfg_cycle = Config {
         low_watermark_gib: 0.000001,
         daemon: vassoura::config::DaemonCfg { notify: false, ..vassoura::config::DaemonCfg::default() },
@@ -327,8 +371,8 @@ fn seen_ordering_drives_daemon_lru() {
     };
     let _ = vassoura::daemon::run_cycle(&cfg_cycle);
 
-    // bb é REESCRITO depois do ciclo 1 e re-envelhecido a 40d: no próximo
-    // refresh o mtime diverge do registrado → atividade → seen avança p/ agora
+    // bb is REWRITTEN after cycle 1 and re-aged to 40d: on the next
+    // refresh the mtime diverges from the recorded one → activity → seen advances to now
     std::fs::write(root.join("bb/node_modules/dep/b.js"), b"z").unwrap();
     let dir = root.join("bb/node_modules");
     age_dir(&dir.join("dep/b.js"), 40);
@@ -337,9 +381,9 @@ fn seen_ordering_drives_daemon_lru() {
 
     let mut cands = vassoura::walk::scan(&cfg, Some(&root), true);
     let mut seen = vassoura::seen::SeenDb::load(&cfg.seen_db);
-    seen.refresh(&cands, std::time::SystemTime::now()); // o que o ciclo 2 faria
+    seen.refresh(&cands, std::time::SystemTime::now()); // what cycle 2 would do
     cands.sort_by_key(|c| seen.last_used(c));
-    assert_eq!(cands[0].path, root.join("aa/node_modules"), "aa mais frio no seen sai primeiro");
+    assert_eq!(cands[0].path, root.join("aa/node_modules"), "aa, colder in seen, leaves first");
     assert!(seen.last_used(&cands[1]) > seen.last_used(&cands[0]));
 }
 
@@ -352,7 +396,7 @@ fn status_json_contract_and_statusfs_match() {
     daemon_tree(&root);
     let cfg = sandbox_cfg(root.clone(), home.clone());
 
-    // o que o `status --json` imprime (mesma função):
+    // what `status --json` prints (same function):
     let d = vassoura::daemon::disk_of(&cfg);
     let cands = vassoura::walk::scan(&cfg, None, true);
     let (items, _) = vassoura::plan::build(cands, &cfg, None);
@@ -369,7 +413,7 @@ fn status_json_contract_and_statusfs_match() {
     assert_eq!(v["eligible"]["bytes"].as_u64().unwrap(), eligible as u64);
     assert_eq!(v["eligible"]["count"].as_u64().unwrap(), items.len() as u64);
 
-    // o que o refresh/daemon escreve no fs de status: mesmos valores
+    // what refresh/daemon writes to the status fs: the same values
     let written = vassoura::statusfs::write_status_dir(&cfg.status_dir, &report).unwrap();
     assert_eq!(written.len(), 10);
     let read = |n: &str| std::fs::read_to_string(cfg.status_dir.join(format!("{n}.txt"))).unwrap().trim().to_string();
@@ -380,8 +424,8 @@ fn status_json_contract_and_statusfs_match() {
 }
 
 // ---------------------------------------------------------------- P1.3
-// Execução das classes de ferramenta com binários FAKES reais (nada toca a
-// carteira do operador): prova o caminho de execução + ledger.
+// Execution of the tool classes with real FAKE binaries (nothing touches the
+// operator's working set): proves the execution path + ledger.
 
 fn make_exec(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
@@ -431,7 +475,7 @@ fn tools_execute_via_cli_and_ledger_each_removal() {
             go: false,
             ..vassoura::config::ToolsCfg::default()
         },
-        // need gigante: o LRU do ollama leva todos os modelos
+        // huge need: ollama LRU takes every model
         until_free_gib: 1e9,
         ..Config::default()
     };
@@ -445,10 +489,10 @@ fn tools_execute_via_cli_and_ledger_each_removal() {
     let plans = vassoura::tools::gather(&cfg, &bins, free);
     let ollama_plan = plans.iter().find(|p| p.tool == "ollama").unwrap();
     let vassoura::tools::ToolPlanOutcome::Plan(actions) = &ollama_plan.outcome else {
-        panic!("esperava plano do ollama")
+        panic!("expected an ollama plan")
     };
-    assert_eq!(actions.len(), 2, "need gigante leva os 2 modelos (LRU)");
-    assert_eq!(actions[0].subject, "old:1b", "mais velho primeiro");
+    assert_eq!(actions.len(), 2, "huge need takes both models (LRU)");
+    assert_eq!(actions[0].subject, "old:1b", "oldest first");
     assert!(actions.iter().all(|a| a.argv[0] == "rm"));
 
     let outs = vassoura::tools::execute(&plans, &bins, &cfg.ledger);
@@ -456,14 +500,14 @@ fn tools_execute_via_cli_and_ledger_each_removal() {
     assert_eq!(ran, 3, "2 ollama rm + 1 docker prune: {outs:?}");
 
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(calls.contains("rm old:1b"), "mais velho sai primeiro: {calls}");
+    assert!(calls.contains("rm old:1b"), "oldest leaves first: {calls}");
     assert!(calls.contains("system prune --force"), "{calls}");
-    assert!(!calls.contains("volume"), "prune nunca toca volumes: {calls}");
+    assert!(!calls.contains("volume"), "prune never touches volumes: {calls}");
 
     let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
     let lines: Vec<serde_json::Value> =
         ledger.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(lines.len(), 3, "uma linha por remoção/ação executada");
+    assert_eq!(lines.len(), 3, "one line per removal/action that ran");
     let ollama_lines: Vec<&serde_json::Value> =
         lines.iter().filter(|v| v["class"] == "ollama").collect();
     assert_eq!(ollama_lines.len(), 2);
@@ -497,11 +541,11 @@ fn tools_missing_binary_fail_closed_and_reported() {
     for p in &plans {
         assert!(
             matches!(p.outcome, vassoura::tools::ToolPlanOutcome::Missing),
-            "{} devia ser Missing (fail-closed)",
+            "{} should be Missing (fail-closed)",
             p.tool
         );
     }
     let outs = vassoura::tools::execute(&plans, &bins, &cfg.ledger);
-    assert!(outs.is_empty(), "Missing não executa nada");
+    assert!(outs.is_empty(), "Missing runs nothing");
     assert!(!cfg.ledger.exists());
 }

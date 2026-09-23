@@ -1,9 +1,9 @@
-//! Daemon (P1.1): loop de poll com marca d'água e HISTERESE.
-//! livre ≥ marca baixa (ou entre as marcas) → nada acontece; livre < baixa →
-//! evicção LRU (mais velho primeiro) limitada por ciclo (bound de bytes +
-//! itens) até livre ≥ marca alta ou esgotar o bound; rate-limit entre ciclos
-//! destrutivos. Toda remoção grava linha no ledger (o ponto único é o
-//! `clean::apply`).
+//! Daemon (P1.1): a poll loop with a watermark and HYSTERESIS.
+//! Free space at or above the low mark (or between the marks) → nothing
+//! happens; free space below the low mark → LRU eviction (oldest first)
+//! bounded per cycle (byte bound + item bound) until free space reaches the
+//! high mark or the bound runs out; a rate-limit between destructive cycles.
+//! Every removal writes a ledger line (the single point is `clean::apply`).
 
 use std::path::Path;
 use std::process::Command;
@@ -19,26 +19,26 @@ use crate::walk;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CycleAction {
-    /// Nada a fazer: livre ≥ marca baixa (ou já ≥ alta).
+    /// Nothing to do: free ≥ low watermark (or already ≥ high).
     Idle,
-    /// Evictar em LRU até `need_bytes` ou esgotar o bound do ciclo.
+    /// Evict LRU until `need_bytes` or the cycle bound runs out.
     Evict { need_bytes: u64, cap_bytes: u64, cap_items: usize },
 }
 
-/// Decisão pura de histerese do ciclo.
+/// Pure hysteresis decision for the cycle.
 pub fn decide_cycle(free: u64, low_bytes: u64, high_bytes: u64, cap_bytes: u64, cap_items: usize) -> CycleAction {
     if free >= low_bytes {
         return CycleAction::Idle;
     }
     let need = high_bytes.saturating_sub(free);
     if need == 0 {
-        // marcas invertidas ou já na meta alta: nada a fazer
+        // inverted marks or already at the high target: nothing to do
         return CycleAction::Idle;
     }
     CycleAction::Evict { need_bytes: need, cap_bytes, cap_items }
 }
 
-/// Rate-limit: houve evicção há menos de `rate_limit` → segura este ciclo.
+/// Rate-limit: an eviction less than `rate_limit` ago → hold this cycle.
 pub fn rate_limited(last_eviction: Option<SystemTime>, now: SystemTime, rate_limit: Duration) -> bool {
     match last_eviction {
         None => false,
@@ -59,41 +59,55 @@ pub struct CycleReport {
     pub skipped: Vec<(std::path::PathBuf, String)>,
 }
 
-/// Um ciclo do daemon: statfs → scan → seen.db → statusfs → decisão →
-/// (evicção bounded com os gates de uso) → ledger.
+/// One daemon cycle: scan → seen.db → **re-stat** → statusfs → decision →
+/// (bounded eviction with the use gates) → ledger.
+///
+/// The statfs that decides is the one AFTER the scan. Inventorying the working
+/// set takes tens of minutes and free space moves during that interval;
+/// deciding from the stat at the start leaves the cycle IDLE with the disk
+/// already below the mark (measured: 45.9 → 20.8 GiB, 110 GiB eligible, IDLE).
 pub fn run_cycle(cfg: &Config) -> CycleReport {
+    run_cycle_sampling(cfg, || disk_of(cfg))
+}
+
+/// `run_cycle` with an injectable disk sampler (tests: free space drops
+/// between the start of the scan and the decision).
+pub fn run_cycle_sampling(cfg: &Config, mut sample_disk: impl FnMut() -> crate::disk::Disk) -> CycleReport {
     let mut rep = CycleReport::default();
-    let d = disk_of(cfg);
+    let d = sample_disk();
     rep.free_before = d.free;
 
     let cands = walk::scan(cfg, None, true);
     rep.scanned = cands.len();
 
-    // seen.db (P2.1): LRU por último-visto, persistido a cada ciclo
+    // seen.db (P2.1): LRU by last-seen, persisted every cycle
     let mut seen = SeenDb::load(&crate::config::expand(&cfg.seen_db));
     seen.refresh(&cands, SystemTime::now());
 
     let (items, _rejected) = plan::build_seen(cands, cfg, None, &seen);
     rep.eligible_bytes = items.iter().map(|i| i.cand.bytes).sum();
 
-    // fs de status (P2.2): mesmos valores de `status --json`
+    // re-stat: the decision and statusfs use the disk now, not before the scan
+    let d_now = sample_disk();
+
+    // status fs (P2.2): the same values as `status --json`
     let report: StatusReport =
-        statusfs::build_report(d, cfg, rep.eligible_bytes, items.len());
+        statusfs::build_report(d_now, cfg, rep.eligible_bytes, items.len());
     if let Err(e) = statusfs::write_status_dir(&crate::config::expand(&cfg.status_dir), &report) {
-        eprintln!("# aviso: statusfs {}: {e}", cfg.status_dir.display());
+        eprintln!("# warning: statusfs {}: {e}", cfg.status_dir.display());
     }
 
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
     let cap_bytes = (cfg.daemon.max_bytes_per_cycle_gib * GIB as f64) as u64;
-    let action = decide_cycle(d.free, low, high, cap_bytes, cfg.daemon.max_items_per_cycle);
+    let action = decide_cycle(d_now.free, low, high, cap_bytes, cfg.daemon.max_items_per_cycle);
     rep.action = Some(action.clone());
     if let CycleAction::Evict { need_bytes, cap_bytes, cap_items } = action {
         let rl = Duration::from_secs(cfg.daemon.rate_limit_secs);
         if rate_limited(seen.last_eviction, SystemTime::now(), rl) {
             rep.rate_limited = true;
         } else if need_bytes > 0 {
-            let packed = plan::pack_capped(items, d.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
+            let packed = plan::pack_capped(items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
             let out = clean::apply(&packed.items, &crate::config::expand(&cfg.ledger));
             rep.removed = out.removed;
             rep.freed = out.freed;
@@ -118,26 +132,26 @@ pub fn run_cycle(cfg: &Config) -> CycleReport {
     }
 
     if let Err(e) = seen.persist(&crate::config::expand(&cfg.seen_db)) {
-        eprintln!("# aviso: seen.db {}: {e}", cfg.seen_db.display());
+        eprintln!("# warning: seen.db {}: {e}", cfg.seen_db.display());
     }
 
-    rep.free_after = disk_of(cfg).free;
+    rep.free_after = sample_disk().free;
     rep
 }
 
-/// Disco da primeira raiz da allowlist (fallback: /).
+/// Disk of the first allowlist root (fallback: /).
 pub fn disk_of(cfg: &Config) -> crate::disk::Disk {
     let p = crate::config::expand(
         cfg.artifact_roots.first().map(|r| r.as_path()).unwrap_or_else(|| Path::new("/")),
     );
-    crate::disk::Disk::snapshot(&p).unwrap_or_else(|| crate::disk::Disk::snapshot(Path::new("/")).expect("statfs de /"))
+    crate::disk::Disk::snapshot(&p).unwrap_or_else(|| crate::disk::Disk::snapshot(Path::new("/")).expect("statfs of /"))
 }
 
-/// Notificação macOS best-effort (falha silenciosa: é cortesia, não gate).
-/// Se `open` for dado e o `terminal-notifier` existir, o CLIQUE abre esse
-/// caminho (o ledger); o osascript puro não permite vincular ação ao clique
-/// (o macOS ativa o app que postou — Script Editor), então o fallback põe o
-/// caminho no corpo da mensagem.
+/// Best-effort macOS notification (silent failure: a courtesy, not a gate).
+/// If `open` is given and `terminal-notifier` exists, the CLICK opens that
+/// path (the ledger); plain osascript cannot bind an action to the click
+/// (macOS activates the app that posted it — Script Editor), so the fallback
+/// puts the path in the message body.
 pub fn notify(title: &str, body: &str, open: Option<&Path>) {
     if let Some(target) = open {
         let url = format!("file://{}", target.display());
@@ -149,7 +163,7 @@ pub fn notify(title: &str, body: &str, open: Option<&Path>) {
         }
     }
     let body = match open {
-        Some(p) => format!("{body} — detalhes: {}", p.display()),
+        Some(p) => format!("{body} — details: {}", p.display()),
         None => body.to_string(),
     };
     let _ = Command::new("osascript")
@@ -162,8 +176,8 @@ pub fn notify(title: &str, body: &str, open: Option<&Path>) {
         .status();
 }
 
-/// Corpo da notificação de evicção: O QUE saiu (até 3 caminhos + contagem)
-/// e quanto liberou.
+/// Eviction notification body: WHAT left (up to 3 paths + a count)
+/// and how much was freed.
 pub fn evicted_body(paths: &[&Path], freed: u64) -> String {
     let shown: Vec<String> = paths.iter().take(3).map(|p| p.display().to_string()).collect();
     let extra = paths.len().saturating_sub(shown.len());
@@ -171,10 +185,10 @@ pub fn evicted_body(paths: &[&Path], freed: u64) -> String {
         0 => shown.join(", "),
         n => format!("{} (+{n})", shown.join(", ")),
     };
-    format!("removido: {list} · {} liberados", human(freed))
+    format!("removed: {list} · {} freed", human(freed))
 }
 
-/// Aspas duplas escapadas para AppleScript (nossas strings são simples).
+/// Escaped double quotes for AppleScript (our strings are simple).
 fn quote_os(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -202,7 +216,7 @@ mod tests {
 
     #[test]
     fn inverted_or_satisfied_marks_are_idle() {
-        // free < low mas já ≥ high (marcas invertidas): não remove nada
+        // free < low but already ≥ high (inverted marks): removes nothing
         assert_eq!(decide_cycle(50 * G, 60 * G, 40 * G, 20 * G, 30), CycleAction::Idle);
     }
 
@@ -224,10 +238,10 @@ mod tests {
         let body = evicted_body(&[a, b], 4096);
         assert!(body.contains("/p/a/node_modules"), "{body}");
         assert!(body.contains("/p/b/node_modules"), "{body}");
-        assert!(body.contains("liberados"), "{body}");
+        assert!(body.contains("freed"), "{body}");
 
         let many = evicted_body(&[a, b, c, Path::new("/p/d/dist")], 4096);
-        assert!(many.contains("(+1)"), "mais que 3 resume a contagem: {many}");
+        assert!(many.contains("(+1)"), "more than 3 summarizes the count: {many}");
     }
 
     #[test]

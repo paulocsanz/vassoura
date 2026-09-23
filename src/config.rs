@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Nomes de diretório regeneráveis por padrão (config pode sobrescrever).
-/// Deliberadamente conservador: `vendor` e `out` ficam de fora (podem conter
-/// patches locais / dados); quem quiser adiciona no config.
+/// Regenerable directory names by default (config may override).
+/// Deliberately conservative: `vendor` and `out` stay out (they may contain
+/// local patches / data); add them in the config if you want them.
 pub const DEFAULT_ARTIFACT_NAMES: &[&str] = &[
     "node_modules",
     "target",
@@ -30,31 +30,37 @@ pub const DEFAULT_ARTIFACT_NAMES: &[&str] = &[
     "cmake-build-release",
 ];
 
-/// Diretórios nunca atravessados durante o scan (são dados, nunca lixo).
+/// Directories never walked during the scan (they are data, never junk).
 pub const PRUNE_DIRS: &[&str] = &[".git", ".fonte"];
 
-/// Bound e cadência do ciclo de evicção do daemon.
+/// Bound and cadence of the daemon eviction cycle.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct DaemonCfg {
-    /// Máximo de bytes removidos por ciclo (bound).
+    /// Maximum bytes removed per cycle (bound).
     #[serde(default = "default_max_bytes_per_cycle_gib")]
     pub max_bytes_per_cycle_gib: f64,
-    /// Máximo de itens removidos por ciclo (bound).
+    /// Maximum items removed per cycle (bound).
     #[serde(default = "default_max_items_per_cycle")]
     pub max_items_per_cycle: usize,
-    /// Intervalo mínimo (segundos) entre dois ciclos de evicção (rate-limit).
+    /// Minimum interval (seconds) between two eviction cycles (rate-limit).
     #[serde(default = "default_rate_limit_secs")]
     pub rate_limit_secs: u64,
-    /// Notificações macOS via osascript (best-effort, só no daemon).
+    /// macOS notifications via osascript (best-effort, daemon only).
     #[serde(default = "default_notify")]
     pub notify: bool,
 }
 
 fn default_max_bytes_per_cycle_gib() -> f64 {
-    20.0
+    // A cycle that fires has to be able to cross the low mark again.
+    // 20 GiB was not enough: the scan takes ~1 h and the disk drops tens of
+    // GiB in that time — the next cycle was born already underwater. 80 GiB
+    // covers the typical distance between "critical" and the target of 100.
+    80.0
 }
 fn default_max_items_per_cycle() -> usize {
-    30
+    // The oldest are not always the largest; 30 small items do not
+    // recover the disk. 200 is still a ceiling (it does not empty the working set).
+    200
 }
 fn default_rate_limit_secs() -> u64 {
     900
@@ -74,8 +80,8 @@ impl Default for DaemonCfg {
     }
 }
 
-/// Toggles das classes de ferramenta (P1.3). Ausência da ferramenta no
-/// PATH é sempre fail-closed: a classe é pulada e reportada.
+/// Toggles for the tool classes (P1.3). A tool missing from PATH is
+/// always fail-closed: the class is skipped and reported.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ToolsCfg {
     #[serde(default = "default_true")]
@@ -84,7 +90,7 @@ pub struct ToolsCfg {
     pub docker: bool,
     #[serde(default = "default_true")]
     pub rustup: bool,
-    /// Quantas toolchains versionadas mais novas manter.
+    /// How many of the newest versioned toolchains to keep.
     #[serde(default = "default_rustup_keep")]
     pub rustup_keep: usize,
     #[serde(default = "default_true")]
@@ -116,35 +122,35 @@ impl Default for ToolsCfg {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub version: u32,
-    /// Ledger append-only de toda evicção.
+    /// Append-only ledger of every eviction.
     pub ledger: PathBuf,
-    /// Registro de "último visto" por candidato (LRU por leitura, P2.1).
+    /// Per-candidate "last seen" record (read-based LRU, P2.1).
     #[serde(default = "default_seen_db")]
     pub seen_db: PathBuf,
-    /// Diretório de status (um arquivo por métrica, P2.2).
+    /// Status directory (one file per metric, P2.2).
     #[serde(default = "default_status_dir")]
     pub status_dir: PathBuf,
-    /// Meta de espaço livre (marca d'água alta): a limpeza evicta até aqui.
+    /// Free-space target (high watermark): cleanup evicts until here.
     pub until_free_gib: f64,
-    /// Marca d'água baixa: abaixo dela o disco está "lotando" (gatilho do daemon P1).
+    /// Low watermark: below it the disk is "filling up" (daemon trigger, P1).
     pub low_watermark_gib: f64,
-    /// Intervalo do loop do daemon (P1).
+    /// Daemon loop interval (P1).
     pub watch_interval_secs: u64,
-    /// Bound e cadência do daemon (P1.1).
+    /// Daemon bound and cadence (P1.1).
     #[serde(default)]
     pub daemon: DaemonCfg,
-    /// Classes de ferramenta (P1.3).
+    /// Tool classes (P1.3).
     #[serde(default)]
     pub tools: ToolsCfg,
-    /// Idade mínima (dias) para um artifact de build ser evictável.
+    /// Minimum age (days) before a build artifact is evictable.
     pub min_age_days_artifacts: u64,
-    /// Idade mínima (dias) para um cache de app (~/Library/Caches etc.).
+    /// Minimum age (days) for an app cache (~/Library/Caches etc.).
     pub min_age_days_app_caches: u64,
-    /// Raízes onde caçar artifacts de build (allowlist — nada fora daqui é tocado).
+    /// Roots where build artifacts are hunted (allowlist — nothing outside is touched).
     pub artifact_roots: Vec<PathBuf>,
-    /// Raízes cujos filhos são caches de app (allowlist).
+    /// Roots whose children are app caches (allowlist).
     pub app_cache_roots: Vec<PathBuf>,
-    /// Nomes de diretório considerados artifacts.
+    /// Directory names treated as artifacts.
     pub artifact_names: Vec<String>,
 }
 
@@ -213,15 +219,15 @@ impl Config {
 
 fn serialize_pretty(cfg: &Config) -> String {
     format!(
-        "# vassoura — coletor de build-lixo com marca d'água\n\
-         # Tudo fora de artifact_roots/app_cache_roots é intocável por construção.\n\
-         # Idade mínima protege o que está em uso; toda remoção vai para o ledger.\n\n{}",
-        toml::to_string_pretty(cfg).expect("config serializa")
+        "# vassoura — watermarked build-artifact collector\n\
+         # Anything outside artifact_roots/app_cache_roots is untouchable by construction.\n\
+         # Minimum age protects what is in use; every removal goes to the ledger.\n\n{}",
+        toml::to_string_pretty(cfg).expect("config serializes")
     )
 }
 
-/// Carrega o config. `--config` explícito inexistente é erro; o caminho
-/// default ausente é criado com os padrões.
+/// Load the config. An explicit `--config` that does not exist is an error;
+/// a missing default path is created with the defaults.
 pub fn load(path: Option<&Path>) -> Result<(Config, PathBuf), String> {
     let default_path = home().join(".vassoura").join("config.toml");
     let (path, explicit) = match path {
@@ -230,27 +236,27 @@ pub fn load(path: Option<&Path>) -> Result<(Config, PathBuf), String> {
     };
     if !path.exists() {
         if explicit {
-            return Err(format!("config não encontrado: {}", path.display()));
+            return Err(format!("config not found: {}", path.display()));
         }
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("criar {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
         let cfg = Config::default();
         fs::write(&path, serialize_pretty(&cfg))
-            .map_err(|e| format!("escrever {}: {e}", path.display()))?;
-        eprintln!("# config criado em {} (padrões; edite as raízes se quiser)", path.display());
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        eprintln!("# config created at {} (defaults; edit the roots if you want)", path.display());
         return Ok((cfg, path));
     }
-    let raw = fs::read_to_string(&path).map_err(|e| format!("ler {}: {e}", path.display()))?;
+    let raw = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let cfg: Config =
         toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     if cfg.version != 1 {
-        return Err(format!("version {} não suportada (esperado 1)", cfg.version));
+        return Err(format!("version {} is not supported (expected 1)", cfg.version));
     }
     Ok((cfg, path))
 }
 
-/// Expande as raízes do config para caminhos absolutos canônicos-lexicais.
+/// Expand config roots to lexically canonical absolute paths.
 pub fn expanded_roots(cfg: &Config) -> Vec<(crate::walk::Class, PathBuf)> {
     let mut v: Vec<(crate::walk::Class, PathBuf)> = cfg
         .artifact_roots
@@ -269,8 +275,8 @@ pub fn expanded_roots(cfg: &Config) -> Vec<(crate::walk::Class, PathBuf)> {
 mod tests {
     use super::*;
 
-    /// Um config v1 escrito antes do P1/P2 (sem os campos novos) continua
-    /// válido: os novos ganham defaults.
+    /// A v1 config written before P1/P2 (without the new fields) stays
+    /// valid: the new ones get defaults.
     #[test]
     fn v1_config_without_new_fields_still_parses() {
         let raw = r#"
@@ -285,7 +291,7 @@ artifact_roots = ["/tmp/software"]
 app_cache_roots = ["/tmp/Caches"]
 artifact_names = ["node_modules", "target"]
 "#;
-        let cfg: Config = toml::from_str(raw).expect("config v1 parseia");
+        let cfg: Config = toml::from_str(raw).expect("v1 config parses");
         assert_eq!(cfg.version, 1);
         assert_eq!(cfg.daemon, DaemonCfg::default());
         assert_eq!(cfg.tools, ToolsCfg::default());
@@ -303,8 +309,8 @@ artifact_names = ["node_modules", "target"]
         assert_eq!(back.seen_db, cfg.seen_db);
     }
 
-    /// [daemon]/[tools] PARCIAIS (ex.: só `notify = false`) também parseiam:
-    /// cada campo ganha seu default individual.
+    /// PARTIAL [daemon]/[tools] tables (e.g. only `notify = false`) also parse:
+    /// each field gets its own default.
     #[test]
     fn partial_daemon_and_tools_tables_parse() {
         let raw = r#"
@@ -325,9 +331,10 @@ notify = false
 [tools]
 ollama = false
 "#;
-        let cfg: Config = toml::from_str(raw).expect("tabela parcial parseia");
+        let cfg: Config = toml::from_str(raw).expect("partial table parses");
         assert!(!cfg.daemon.notify);
-        assert_eq!(cfg.daemon.max_items_per_cycle, 30);
+        assert_eq!(cfg.daemon.max_items_per_cycle, 200);
+        assert_eq!(cfg.daemon.max_bytes_per_cycle_gib, 80.0);
         assert_eq!(cfg.daemon.rate_limit_secs, 900);
         assert!(!cfg.tools.ollama);
         assert_eq!(cfg.tools.rustup_keep, 3);

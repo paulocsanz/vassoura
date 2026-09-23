@@ -1,12 +1,12 @@
-//! Artefato launchd (P1.1): o plist do LaunchAgent e o meio de instalá-lo.
-//! Instalar escreve o plist em `~/Library/LaunchAgents`; CARREGAR na sessão
-//! launchd é decisão do operador (o comando é impresso, não executado).
+//! launchd artifact (P1.1): the LaunchAgent plist and the way to install it.
+//! Installing writes the plist to `~/Library/LaunchAgents`. LOADING it into
+//! the launchd session is your decision (the command is printed, not run).
 
 use std::path::{Path, PathBuf};
 
 pub const LABEL: &str = "com.vassoura.daemon";
 
-/// Gera o plist do LaunchAgent (função pura — testada).
+/// Build the LaunchAgent plist (pure function — tested).
 pub fn plist_content(bin: &Path, config: &Path, interval_secs: u64, home: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -40,15 +40,15 @@ pub fn plist_content(bin: &Path, config: &Path, interval_secs: u64, home: &Path)
     )
 }
 
-/// Escreve o plist em `~/Library/LaunchAgents/{LABEL}.plist` e devolve o
-/// caminho. Não carrega nada na sessão launchd — isso é com o operador.
+/// Write the plist to `~/Library/LaunchAgents/{LABEL}.plist` and return the
+/// path. Does not load anything into the launchd session — that is up to you.
 pub fn install(bin: &Path, config: &Path, interval_secs: u64) -> Result<PathBuf, String> {
     let home = crate::config::home();
     let dir = home.join("Library").join("LaunchAgents");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("criar {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let path = dir.join(format!("{LABEL}.plist"));
     std::fs::write(&path, plist_content(bin, config, interval_secs, &home))
-        .map_err(|e| format!("escrever {}: {e}", path.display()))?;
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -65,7 +65,7 @@ mod tests {
             Path::new("/Users/t"),
         );
         assert!(s.contains("<string>com.vassoura.daemon</string>"));
-        assert!(s.contains("<string>daemon</string>"), "invoca o subcomando daemon");
+        assert!(s.contains("<string>daemon</string>"), "invokes the daemon subcommand");
         assert!(s.contains("<string>--config</string>"));
         assert!(s.contains("<string>/Users/t/.vassoura/config.toml</string>"));
         assert!(s.contains("<integer>300</integer>"));

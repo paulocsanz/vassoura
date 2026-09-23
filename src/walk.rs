@@ -23,15 +23,20 @@ impl Class {
     }
 }
 
-/// Um diretório regenerável catalogado: quanto ocupa, quando foi escrito
-/// pela última vez (mtime mais novo encontrado na árvore) e se contém `.git`
-/// (contém → protegido, nunca evictado).
+/// A cataloged regenerable directory: how much it occupies, when it was last
+/// written (newest mtime found in the tree), and whether it contains `.git`
+/// (contains → protected, never evicted).
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub path: PathBuf,
     pub class: Class,
     pub bytes: u64,
+    /// Newest mtime of any entry in the tree (age / LRU fallback).
     pub newest_mtime: SystemTime,
+    /// Mtime of the candidate root at scan time. This is what `clean`
+    /// re-stats: comparing with `newest_mtime` marks "changed" on almost every
+    /// directory, because an inner file is newer than the root.
+    pub root_mtime: SystemTime,
     pub contains_git: bool,
     pub entries: u64,
 }
@@ -50,7 +55,7 @@ impl Progress {
         self.entries += 1;
         self.bytes += add;
         if !self.quiet && self.entries.is_multiple_of(200_000) {
-            eprint!("\r  … {} entradas, {}", self.entries, crate::fmt_util::human(self.bytes));
+            eprint!("\r  … {} entries, {}", self.entries, crate::fmt_util::human(self.bytes));
             use std::io::Write;
             let _ = std::io::stderr().flush();
         }
@@ -62,9 +67,9 @@ impl Progress {
     }
 }
 
-/// Escaneia as raízes do config e devolve os candidatos deduplicados.
-/// `root_filter` restringe o scan a um subdiretório (as raízes são
-/// aparadas para não andar o mundo à toa).
+/// Scan the config roots and return deduplicated candidates.
+/// `root_filter` restricts the scan to a subdirectory (roots are
+/// trimmed so we do not walk the world for nothing).
 pub fn scan(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<Candidate> {
     let names: HashSet<&str> = cfg.artifact_names.iter().map(|s| s.as_str()).collect();
     let prune: HashSet<&str> = PRUNE_DIRS.iter().copied().collect();
@@ -107,7 +112,7 @@ pub fn scan(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<Candid
 
     prog.finish();
 
-    // Dedup por caminho (raízes sobrepostas) + allowlist reforçada.
+    // Dedup by path (overlapping roots) + reinforced allowlist.
     let allowed = crate::config::expanded_roots(cfg);
     let mut seen: HashSet<PathBuf> = HashSet::new();
     out.retain(|c| {
@@ -119,8 +124,8 @@ pub fn scan(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<Candid
     out
 }
 
-/// Recursão manual: ao casar um nome regenerável, mede e NÃO desce
-/// (node_modules dentro de node_modules é do dono de cima).
+/// Manual recursion: on a regenerable name, measure and do NOT descend
+/// (node_modules inside node_modules belongs to the outer owner).
 fn hunt(dir: &Path, names: &HashSet<&str>, prune: &HashSet<&str>, out: &mut Vec<Candidate>, prog: &mut Progress) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
@@ -145,17 +150,19 @@ fn mtime_of(md: &std::fs::Metadata) -> Option<SystemTime> {
     md.modified().ok()
 }
 
-/// Mede a árvore: bytes somados (sem seguir symlinks), mtime mais novo
-/// de qualquer entrada (arquivo ou diretório) e presença de `.git`.
+/// Measure the tree: summed bytes (without following symlinks), newest mtime
+/// of any entry (file or directory), and presence of `.git`.
 fn measure(path: &Path, class: Class, prog: &mut Progress) -> Candidate {
     let mut bytes = 0u64;
     let mut newest = SystemTime::UNIX_EPOCH;
+    let mut root_mtime = SystemTime::UNIX_EPOCH;
     let mut contains_git = false;
     let mut entries = 0u64;
 
     if let Ok(md) = fs::symlink_metadata(path) {
         if let Some(t) = mtime_of(&md) {
             newest = t;
+            root_mtime = t;
         }
     }
 
@@ -178,7 +185,7 @@ fn measure(path: &Path, class: Class, prog: &mut Progress) -> Candidate {
         bytes += md.len();
     }
 
-    Candidate { path: path.to_path_buf(), class, bytes, newest_mtime: newest, contains_git, entries }
+    Candidate { path: path.to_path_buf(), class, bytes, newest_mtime: newest, root_mtime, contains_git, entries }
 }
 
 #[cfg(test)]
@@ -206,9 +213,9 @@ mod tests {
         let root = tmp.path();
         mk(&root.join("a/node_modules/pkg.js"), 100, 40);
         mk(&root.join("b/target/lib.rlib"), 200, 10);
-        // dentro de .git: intocável
+        // inside .git: untouchable
         mk(&root.join(".git/node_modules/x.js"), 999, 400);
-        // symlink com nome regenerável: pulado
+        // symlink with a regenerable name: skipped
         std::os::unix::fs::symlink(root.join("a"), root.join("c")).unwrap();
         std::os::unix::fs::symlink(root.join("a/node_modules"), root.join("d")).unwrap();
 
@@ -219,7 +226,7 @@ mod tests {
         hunt(root, &names, &prune, &mut out, &mut prog);
 
         out.sort_by_key(|c| c.path.clone());
-        assert_eq!(out.len(), 2, "symlink e .git não contam: {:?}", out);
+        assert_eq!(out.len(), 2, "symlink and .git do not count: {:?}", out);
         assert_eq!(out[0].path, root.join("a/node_modules"));
         assert_eq!(out[0].bytes, 100);
         assert_eq!(out[1].bytes, 200);
@@ -236,6 +243,6 @@ mod tests {
 
         let mut prog = Progress::new(true);
         let c = measure(&nm, Class::Artifact, &mut prog);
-        assert!(c.contains_git, ".git interno precisa ser detectado");
+        assert!(c.contains_git, "inner .git must be detected");
     }
 }

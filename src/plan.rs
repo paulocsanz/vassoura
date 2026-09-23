@@ -6,8 +6,8 @@ use crate::fmt_util::{age_days, GIB};
 use crate::seen::SeenDb;
 use crate::walk::Candidate;
 
-/// Candidato elegível com idade resolvida e dica de regeneração.
-/// `last_used` é a chave LRU (último-visto do seen.db; mtime como fallback).
+/// Eligible candidate with a resolved age and a regeneration hint.
+/// `last_used` is the LRU key (last-seen from seen.db; mtime as fallback).
 #[derive(Debug, Clone)]
 pub struct PlanItem {
     pub cand: Candidate,
@@ -16,7 +16,7 @@ pub struct PlanItem {
     pub hint: String,
 }
 
-/// Candidato fora do plano, com o motivo (aparece no relatório).
+/// Candidate left out of the plan, with the reason (shown in the report).
 #[derive(Debug, Clone)]
 pub struct Rejected {
     pub path: std::path::PathBuf,
@@ -24,7 +24,7 @@ pub struct Rejected {
     pub reason: String,
 }
 
-/// Separa elegíveis (idade ≥ mínimo da classe, sem `.git` interno).
+/// Split out the eligible ones (age ≥ the class minimum, no inner `.git`).
 pub fn build(
     cands: Vec<Candidate>,
     cfg: &Config,
@@ -33,7 +33,7 @@ pub fn build(
     build_inner(cands, cfg, override_min, None)
 }
 
-/// `build` com LRU por último-visto (seen.db, P2.1); sem registro usa mtime.
+/// `build` with LRU by last-seen (seen.db, P2.1); with no record, uses mtime.
 pub fn build_seen(
     cands: Vec<Candidate>,
     cfg: &Config,
@@ -57,7 +57,7 @@ fn build_inner(
             rejected.push(Rejected {
                 path: c.path.clone(),
                 bytes: 0,
-                reason: "vazio (0 B)".into(),
+                reason: "empty (0 B)".into(),
             });
             continue;
         }
@@ -65,7 +65,7 @@ fn build_inner(
             rejected.push(Rejected {
                 path: c.path.clone(),
                 bytes: c.bytes,
-                reason: "contém .git (protegido)".into(),
+                reason: "contains .git (protected)".into(),
             });
             continue;
         }
@@ -75,7 +75,7 @@ fn build_inner(
             rejected.push(Rejected {
                 path: c.path.clone(),
                 bytes: c.bytes,
-                reason: format!("jovem: {age:.0}d < {min}d"),
+                reason: format!("young: {age:.0}d < {min}d"),
             });
             continue;
         }
@@ -90,7 +90,7 @@ fn build_inner(
 }
 
 pub struct Packed {
-    /// Ordem de evicção: mais velho primeiro (LRU por última escrita).
+    /// Eviction order: oldest first (LRU by last write).
     pub items: Vec<PlanItem>,
     pub target_bytes: u64,
     pub need_bytes: u64,
@@ -98,13 +98,21 @@ pub struct Packed {
     pub reached: bool,
 }
 
-/// Empacota elegíveis em ordem LRU (menos recentemente usado primeiro) até a
-/// meta de espaço livre, o teto de itens `top` ou o teto de bytes por ciclo.
+/// Below this the item is dust: it does not take a plan slot while a large
+/// candidate remains and the byte target has not been met. Without this the
+/// item cap fills with `__pycache__` of tens of KiB (the oldest) and the
+/// GiB-sized `target`/`node_modules` stay out — seen on 2026-09-23:
+/// 400 items, 5.2 GiB in the plan, 55 MiB actually freed, disk still full.
+const SLOT_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// Pack eligible items in LRU order (least recently used first) until the
+/// free-space target, the `top` item cap, or the per-cycle byte cap.
+/// Items ≥ `SLOT_FLOOR` go in first; dust only takes a slot afterwards.
 pub fn pack(items: Vec<PlanItem>, free: u64, until_free_gib: f64, top: usize) -> Packed {
     pack_capped(items, free, until_free_gib, top, None)
 }
 
-/// `pack` com bound de bytes por ciclo (daemon: histerese limitada).
+/// `pack` with a per-cycle byte bound (daemon: bounded hysteresis).
 pub fn pack_capped(
     mut items: Vec<PlanItem>,
     free: u64,
@@ -112,22 +120,31 @@ pub fn pack_capped(
     top: usize,
     cap_bytes: Option<u64>,
 ) -> Packed {
-    items.sort_by(|a, b| {
+    let by_lru = |a: &PlanItem, b: &PlanItem| {
         a.last_used
             .cmp(&b.last_used)
             .then(b.cand.bytes.cmp(&a.cand.bytes))
-    });
+    };
+    items.sort_by(by_lru);
+    let (mut big, mut dust) = (Vec::new(), Vec::new());
+    for it in items {
+        if it.cand.bytes >= SLOT_FLOOR {
+            big.push(it);
+        } else {
+            dust.push(it);
+        }
+    }
     let target = (until_free_gib * GIB as f64) as u64;
     let need = target.saturating_sub(free);
     let mut planned = 0u64;
     let mut out = Vec::new();
-    for it in items {
+    for it in big.into_iter().chain(dust) {
         if planned >= need || out.len() >= top {
             break;
         }
-        // bound por ciclo: item que estoura o cap fica fora do ciclo; a única
-        // exceção é o primeiro item (garantia de progresso — sem isso um
-        // candidato maior que o cap nunca sairia).
+        // per-cycle bound: an item that blows the cap stays out of the cycle; the
+        // only exception is the first item (progress guarantee — without it a
+        // candidate larger than the cap would never leave).
         if let Some(cap) = cap_bytes {
             if !out.is_empty() && planned.saturating_add(it.cand.bytes) > cap {
                 continue;
@@ -144,7 +161,7 @@ fn has(dir: &Path, name: &str) -> bool {
     dir.join(name).exists()
 }
 
-/// Dica de como trazer o diretório de volta — registrada no ledger.
+/// Hint for how to bring the directory back — recorded in the ledger.
 pub fn regen_hint(path: &Path) -> String {
     let parent = path.parent().unwrap_or(path);
     let in_lake = path.ancestors().any(|a| a.file_name().is_some_and(|n| n == ".lake"));
@@ -179,7 +196,7 @@ pub fn regen_hint(path: &Path) -> String {
         return "gradle build".into();
     }
     if has(parent, "pyproject.toml") || has(parent, "requirements.txt") {
-        return "recriar venv + pip install".into();
+        return "recreate the venv + pip install".into();
     }
     if has(parent, "go.mod") {
         return "go mod download && go build".into();
@@ -190,7 +207,7 @@ pub fn regen_hint(path: &Path) -> String {
     if has(parent, "Gemfile") {
         return "bundle install".into();
     }
-    "rebuild do projeto (regenerável)".into()
+    "rebuild the project (regenerable)".into()
 }
 
 #[cfg(test)]
@@ -205,6 +222,7 @@ mod tests {
             class: Class::Artifact,
             bytes,
             newest_mtime: SystemTime::now() - Duration::from_secs(age_d * 86400),
+            root_mtime: SystemTime::now() - Duration::from_secs(age_d * 86400),
             contains_git: false,
             entries: 1,
         }
@@ -239,7 +257,7 @@ mod tests {
     fn pack_respects_top_and_reports_unreached() {
         let items = vec![item("/x/a", 5 * GIB, 100), item("/x/b", 5 * GIB, 90), item("/x/c", 5 * GIB, 80)];
         let p = pack(items, 0, 100.0, 2);
-        assert!(!p.reached, "top cortou antes da meta");
+        assert!(!p.reached, "top cut off before the target");
         assert_eq!(p.items.len(), 2);
     }
 
@@ -250,14 +268,14 @@ mod tests {
             item("/x/velho2", 10 * GIB, 90),
             item("/x/velho3", 10 * GIB, 80),
         ];
-        // meta inalcançável (need 100 GiB), cap 25 GiB por ciclo: 2 itens
-        // (20 ≤ 25); o 3º estouraria → fica para o próximo ciclo.
+        // unreachable target (need 100 GiB), cap 25 GiB per cycle: 2 items
+        // (20 ≤ 25); the 3rd would blow it → left for the next cycle.
         let p = pack_capped(items, 0, 100.0, 100, Some(25 * GIB));
-        assert!(!p.reached, "cap esgota antes da meta");
+        assert!(!p.reached, "cap runs out before the target");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.planned_bytes, 20 * GIB);
 
-        // cap menor que qualquer item: só o LRU (progresso), nunca dois.
+        // cap smaller than any item: only the LRU one (progress), never two.
         let items2 = vec![item("/x/velho1", 10 * GIB, 100), item("/x/velho2", 10 * GIB, 90)];
         let p2 = pack_capped(items2, 0, 100.0, 100, Some(5 * GIB));
         assert_eq!(p2.items.len(), 1);
@@ -265,8 +283,21 @@ mod tests {
     }
 
     #[test]
+    fn pack_fills_slots_with_large_items_before_ancient_dust() {
+        // ancient dust must not spend the item cap while a GiB-sized
+        // target (newer, already above the minimum age) exists.
+        let mut items: Vec<PlanItem> = (0..10)
+            .map(|i| item(&format!("/dust/{i}"), 20 * 1024, 400))
+            .collect();
+        items.push(item("/big/target", 8 * GIB, 20));
+        let p = pack(items, 2 * GIB, 40.0, 5);
+        assert_eq!(p.items[0].cand.path, Path::new("/big/target"));
+        assert!(p.planned_bytes >= 8 * GIB);
+    }
+
+    #[test]
     fn pack_orders_by_last_used_not_mtime() {
-        // velho por mtime, mas visto recentemente (seen) → sai depois
+        // old by mtime, but seen recently → leaves later
         let mut a = item("/x/mtime-velho-seen-novo", 5 * GIB, 300);
         a.last_used = SystemTime::now() - Duration::from_secs(3600);
         let b = item("/x/seen-velho", 5 * GIB, 10);
