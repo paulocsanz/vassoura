@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Template do LaunchAgent do vassoura.
+     NÃO copie à mão: `vassoura install-daemon` gera o plist final (com os
+     caminhos do binário e do config resolvidos) em ~/Library/LaunchAgents/
+     com.vassoura.daemon.plist e imprime o comando launchctl. Carregar na
+     sessão launchd é decisão do operador. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vassoura.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/vassoura</string>
+        <string>--config</string>
+        <string>~/.vassoura/config.toml</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>~/.vassoura/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/.vassoura/daemon.log</string>
+</dict>
+</plist>

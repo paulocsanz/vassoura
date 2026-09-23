@@ -11,15 +11,31 @@ pub struct Outcome {
     pub skipped: Vec<(std::path::PathBuf, String)>,
 }
 
-/// Executa o plano com os gates do último instante:
-/// 1. o caminho ainda existe e ainda é diretório (sem symlink);
-/// 2. o mtime da raiz é exatamente o do scan — se algo escreveu lá
+/// Executa o plano com os gates do último instante (produção: lsof + git,
+/// fail-closed — P1.2):
+/// 1. o candidato não está em uso (arquivo aberto por processo vivo /
+///    worktree com trabalho não-commitado) — gates indisponíveis pulam;
+/// 2. o caminho ainda existe e ainda é diretório (sem symlink);
+/// 3. o mtime da raiz é exatamente o do scan — se algo escreveu lá
 ///    dentro depois do scan, a evicção é abortada para aquele item;
-/// 3. toda remoção bem-sucedida nasce com linha no ledger.
+/// 4. toda remoção bem-sucedida nasce com linha no ledger.
 pub fn apply(items: &[PlanItem], ledger_path: &Path) -> Outcome {
+    apply_with(items, ledger_path, &crate::gates::in_use)
+}
+
+/// `apply` com predicado de uso injetável (testes determinísticos).
+pub fn apply_with(
+    items: &[PlanItem],
+    ledger_path: &Path,
+    in_use: &dyn Fn(&Path) -> Option<String>,
+) -> Outcome {
     let mut out = Outcome::default();
     for it in items {
         let path = &it.cand.path;
+        if let Some(why) = in_use(path) {
+            out.skipped.push((path.clone(), why));
+            continue;
+        }
         let Ok(md) = fs::symlink_metadata(path) else {
             out.skipped.push((path.clone(), "sumiu desde o scan".into()));
             continue;
@@ -77,6 +93,7 @@ mod tests {
                 entries: 1,
             },
             age_days: age_d as f64,
+            last_used: newest,
             hint: "pnpm install".into(),
         }
     }
@@ -102,7 +119,8 @@ mod tests {
             item(&a, 200, 30, old_mtime),
             item(&b, 200, 30, stale_b),
         ];
-        let out = apply(&items, &ledger);
+        let noop = |_p: &std::path::Path| None;
+        let out = apply_with(&items, &ledger, &noop);
 
         assert_eq!(out.removed, 1);
         assert!(out.skipped.iter().any(|(p, _)| p == &b), "b precisa ser protegido");
@@ -114,5 +132,28 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(v["path"], a.display().to_string());
         assert_eq!(v["hint"], "pnpm install");
+    }
+
+    #[test]
+    fn apply_skips_in_use_without_removal_or_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("f.bin"), vec![0u8; 128]).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(30 * 86400);
+        filetime::set_file_times(&a, old.into(), old.into()).unwrap();
+        let it = item(&a, 128, 30, old);
+        let ledger = tmp.path().join("ledger.jsonl");
+
+        let gate = |p: &std::path::Path| {
+            (p == &a).then(|| "em uso: processo com arquivo aberto".to_string())
+        };
+        let out = apply_with(std::slice::from_ref(&it), &ledger, &gate);
+
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.skipped.len(), 1);
+        assert!(out.skipped[0].1.contains("em uso"), "{:?}", out.skipped[0]);
+        assert!(a.exists(), "em uso não é removido");
+        assert!(!ledger.exists(), "sem remoção não nasce linha no ledger");
     }
 }

@@ -1,7 +1,13 @@
 pub mod clean;
 pub mod config;
+pub mod daemon;
 pub mod disk;
 pub mod fmt_util;
+pub mod gates;
+pub mod launchd;
 pub mod ledger;
 pub mod plan;
+pub mod seen;
+pub mod statusfs;
+pub mod tools;
 pub mod walk;

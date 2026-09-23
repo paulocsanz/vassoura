@@ -33,17 +33,109 @@ pub const DEFAULT_ARTIFACT_NAMES: &[&str] = &[
 /// Diretórios nunca atravessados durante o scan (são dados, nunca lixo).
 pub const PRUNE_DIRS: &[&str] = &[".git", ".fonte"];
 
+/// Bound e cadência do ciclo de evicção do daemon.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DaemonCfg {
+    /// Máximo de bytes removidos por ciclo (bound).
+    #[serde(default = "default_max_bytes_per_cycle_gib")]
+    pub max_bytes_per_cycle_gib: f64,
+    /// Máximo de itens removidos por ciclo (bound).
+    #[serde(default = "default_max_items_per_cycle")]
+    pub max_items_per_cycle: usize,
+    /// Intervalo mínimo (segundos) entre dois ciclos de evicção (rate-limit).
+    #[serde(default = "default_rate_limit_secs")]
+    pub rate_limit_secs: u64,
+    /// Notificações macOS via osascript (best-effort, só no daemon).
+    #[serde(default = "default_notify")]
+    pub notify: bool,
+}
+
+fn default_max_bytes_per_cycle_gib() -> f64 {
+    20.0
+}
+fn default_max_items_per_cycle() -> usize {
+    30
+}
+fn default_rate_limit_secs() -> u64 {
+    900
+}
+fn default_notify() -> bool {
+    true
+}
+
+impl Default for DaemonCfg {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_cycle_gib: default_max_bytes_per_cycle_gib(),
+            max_items_per_cycle: default_max_items_per_cycle(),
+            rate_limit_secs: default_rate_limit_secs(),
+            notify: default_notify(),
+        }
+    }
+}
+
+/// Toggles das classes de ferramenta (P1.3). Ausência da ferramenta no
+/// PATH é sempre fail-closed: a classe é pulada e reportada.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ToolsCfg {
+    #[serde(default = "default_true")]
+    pub ollama: bool,
+    #[serde(default = "default_true")]
+    pub docker: bool,
+    #[serde(default = "default_true")]
+    pub rustup: bool,
+    /// Quantas toolchains versionadas mais novas manter.
+    #[serde(default = "default_rustup_keep")]
+    pub rustup_keep: usize,
+    #[serde(default = "default_true")]
+    pub pnpm: bool,
+    #[serde(default = "default_true")]
+    pub go: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_rustup_keep() -> usize {
+    3
+}
+
+impl Default for ToolsCfg {
+    fn default() -> Self {
+        Self {
+            ollama: true,
+            docker: true,
+            rustup: true,
+            rustup_keep: default_rustup_keep(),
+            pnpm: true,
+            go: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub version: u32,
     /// Ledger append-only de toda evicção.
     pub ledger: PathBuf,
+    /// Registro de "último visto" por candidato (LRU por leitura, P2.1).
+    #[serde(default = "default_seen_db")]
+    pub seen_db: PathBuf,
+    /// Diretório de status (um arquivo por métrica, P2.2).
+    #[serde(default = "default_status_dir")]
+    pub status_dir: PathBuf,
     /// Meta de espaço livre (marca d'água alta): a limpeza evicta até aqui.
     pub until_free_gib: f64,
     /// Marca d'água baixa: abaixo dela o disco está "lotando" (gatilho do daemon P1).
     pub low_watermark_gib: f64,
     /// Intervalo do loop do daemon (P1).
     pub watch_interval_secs: u64,
+    /// Bound e cadência do daemon (P1.1).
+    #[serde(default)]
+    pub daemon: DaemonCfg,
+    /// Classes de ferramenta (P1.3).
+    #[serde(default)]
+    pub tools: ToolsCfg,
     /// Idade mínima (dias) para um artifact de build ser evictável.
     pub min_age_days_artifacts: u64,
     /// Idade mínima (dias) para um cache de app (~/Library/Caches etc.).
@@ -58,6 +150,14 @@ pub struct Config {
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
+}
+
+fn default_seen_db() -> PathBuf {
+    home().join(".vassoura").join("seen.db")
+}
+
+fn default_status_dir() -> PathBuf {
+    home().join("Vassoura")
 }
 
 pub fn expand(p: &Path) -> PathBuf {
@@ -86,11 +186,15 @@ impl Default for Config {
         Self {
             version: 1,
             ledger: home().join(".vassoura").join("ledger.jsonl"),
+            seen_db: default_seen_db(),
+            status_dir: default_status_dir(),
             until_free_gib: 100.0,
             low_watermark_gib: 40.0,
             watch_interval_secs: 300,
             min_age_days_artifacts: 14,
             min_age_days_app_caches: 30,
+            daemon: DaemonCfg::default(),
+            tools: ToolsCfg::default(),
             artifact_roots: vec![software_root()],
             app_cache_roots: vec![home().join("Library").join("Caches"), home().join(".cache")],
             artifact_names: DEFAULT_ARTIFACT_NAMES.iter().map(|s| s.to_string()).collect(),
@@ -159,4 +263,73 @@ pub fn expanded_roots(cfg: &Config) -> Vec<(crate::walk::Class, PathBuf)> {
             .map(|p| (crate::walk::Class::AppCache, expand(p))),
     );
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Um config v1 escrito antes do P1/P2 (sem os campos novos) continua
+    /// válido: os novos ganham defaults.
+    #[test]
+    fn v1_config_without_new_fields_still_parses() {
+        let raw = r#"
+version = 1
+ledger = "/tmp/l.jsonl"
+until_free_gib = 100.0
+low_watermark_gib = 40.0
+watch_interval_secs = 300
+min_age_days_artifacts = 14
+min_age_days_app_caches = 30
+artifact_roots = ["/tmp/software"]
+app_cache_roots = ["/tmp/Caches"]
+artifact_names = ["node_modules", "target"]
+"#;
+        let cfg: Config = toml::from_str(raw).expect("config v1 parseia");
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.daemon, DaemonCfg::default());
+        assert_eq!(cfg.tools, ToolsCfg::default());
+        assert_eq!(cfg.seen_db, default_seen_db());
+        assert_eq!(cfg.status_dir, default_status_dir());
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let cfg = Config::default();
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.daemon, cfg.daemon);
+        assert_eq!(back.tools, cfg.tools);
+        assert_eq!(back.seen_db, cfg.seen_db);
+    }
+
+    /// [daemon]/[tools] PARCIAIS (ex.: só `notify = false`) também parseiam:
+    /// cada campo ganha seu default individual.
+    #[test]
+    fn partial_daemon_and_tools_tables_parse() {
+        let raw = r#"
+version = 1
+ledger = "/tmp/l.jsonl"
+until_free_gib = 100.0
+low_watermark_gib = 40.0
+watch_interval_secs = 300
+min_age_days_artifacts = 14
+min_age_days_app_caches = 30
+artifact_roots = ["/tmp/software"]
+app_cache_roots = ["/tmp/Caches"]
+artifact_names = ["node_modules"]
+
+[daemon]
+notify = false
+
+[tools]
+ollama = false
+"#;
+        let cfg: Config = toml::from_str(raw).expect("tabela parcial parseia");
+        assert!(!cfg.daemon.notify);
+        assert_eq!(cfg.daemon.max_items_per_cycle, 30);
+        assert_eq!(cfg.daemon.rate_limit_secs, 900);
+        assert!(!cfg.tools.ollama);
+        assert_eq!(cfg.tools.rustup_keep, 3);
+    }
 }
