@@ -208,6 +208,16 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
     jobs
 }
 
+fn has_sub_repos(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else { return false };
+    for entry in rd.flatten() {
+        if entry.path().join(".git").exists() {
+            return true;
+        }
+    }
+    false
+}
+
 fn split_root(dir: &Path, names: &HashSet<&str>, prune: &HashSet<&str>) -> Vec<ScanJob> {
     let mut jobs = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else { return jobs };
@@ -223,6 +233,16 @@ fn split_root(dir: &Path, names: &HashSet<&str>, prune: &HashSet<&str>) -> Vec<S
         }
         if names.contains(name.as_ref()) {
             jobs.push(ScanJob::Measure { path: entry.path(), class: Class::Artifact });
+        } else if !entry.path().join(".git").exists() && has_sub_repos(&entry.path()) {
+            // Container directory without its own .git (e.g. software/railway):
+            // split its immediate children into jobs so parallel workers can balance
+            // sub-projects across the pool instead of one worker doing 100 repos alone.
+            let sub = split_root(&entry.path(), names, prune);
+            if sub.is_empty() {
+                jobs.push(ScanJob::Hunt(entry.path()));
+            } else {
+                jobs.extend(sub);
+            }
         } else {
             jobs.push(ScanJob::Hunt(entry.path()));
         }
@@ -286,9 +306,9 @@ pub(crate) fn measure_budgeted(
     prog: &mut Progress,
     beat: &mut dyn FnMut(),
 ) -> Candidate {
-    // 80k entries is enough to know a tree is huge and, via BFS, to have seen
-    // the shallow mtimes that decide age. 45s bounds a slow-but-alive disk.
-    measure_inner(path, class, prog, 80_000, std::time::Duration::from_secs(45), beat)
+    // 40k entries is enough to know a tree is huge and, via BFS, to have seen
+    // the shallow mtimes that decide age. 15s bounds a slow-but-alive disk.
+    measure_inner(path, class, prog, 40_000, std::time::Duration::from_secs(15), beat)
 }
 
 /// Measure the tree: summed bytes (without following symlinks), newest mtime

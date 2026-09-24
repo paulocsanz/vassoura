@@ -138,6 +138,17 @@ impl SeenDb {
     pub fn mark_eviction(&mut self, now: SystemTime) {
         self.last_eviction = Some(now);
     }
+
+    /// Mark a path as actively in-use (e.g. uncommitted worktree or open file)
+    /// so it moves to the back of the LRU queue and doesn't block clean candidates.
+    pub fn mark_active(&mut self, path: &Path, now: SystemTime) {
+        let key = path.display().to_string();
+        if let Some(e) = self.entries.get_mut(&key) {
+            e.last_seen = now;
+        } else {
+            self.entries.insert(key, SeenEntry { last_seen: now, last_mtime: now });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +251,14 @@ mod tests {
         keyed.sort_by_key(|(_, k)| *k);
         assert_eq!(keyed[0].0, "/virgem", "never-seen (mtime 90d) leaves first");
         assert!(keyed[1].0 == "/restored" && db.last_used(&restored) > old);
+    }
+
+    #[test]
+    fn mark_active_advances_last_seen() {
+        let mut db = SeenDb::default();
+        let c = cand("/in/use", 1000);
+        let now = SystemTime::now();
+        db.mark_active(Path::new("/in/use"), now);
+        assert_eq!(db.last_used(&c), now);
     }
 }

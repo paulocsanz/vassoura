@@ -217,7 +217,7 @@ fn git_dirty_files_timeout(repo: &Path) -> Result<Vec<PathBuf>, String> {
 fn lsof_snapshot() -> (bool, Vec<PathBuf>) {
     let out = crate::procutil::output_with_timeout(
         Command::new("lsof").args(["-n", "-P", "-F", "n"]),
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
     );
     let Ok(out) = out else {
         return (false, Vec::new());

@@ -67,20 +67,37 @@ pub struct CycleReport {
 /// deciding from the stat at the start leaves the cycle IDLE with the disk
 /// already below the mark (measured: 45.9 → 20.8 GiB, 110 GiB eligible, IDLE).
 pub fn run_cycle(cfg: &Config) -> CycleReport {
-    run_cycle_sampling(cfg, || disk_of(cfg))
+    run_cycle_sampling_opts(cfg, || disk_of(cfg), false)
+}
+
+/// Run cycle with forced eviction (bypasses rate-limiting, e.g. when woken
+/// by fast probe on critical disk usage >= 95%).
+pub fn run_cycle_forced(cfg: &Config) -> CycleReport {
+    run_cycle_sampling_opts(cfg, || disk_of(cfg), true)
 }
 
 /// `run_cycle` with an injectable disk sampler (tests: free space drops
 /// between the start of the scan and the decision).
-pub fn run_cycle_sampling(cfg: &Config, mut sample_disk: impl FnMut() -> crate::disk::Disk) -> CycleReport {
+pub fn run_cycle_sampling(cfg: &Config, sample_disk: impl FnMut() -> crate::disk::Disk) -> CycleReport {
+    run_cycle_sampling_opts(cfg, sample_disk, false)
+}
+
+pub fn run_cycle_sampling_opts(
+    cfg: &Config,
+    mut sample_disk: impl FnMut() -> crate::disk::Disk,
+    force: bool,
+) -> CycleReport {
     let mut rep = CycleReport::default();
     let d = sample_disk();
     rep.free_before = d.free;
 
-    // The worker pool bounds each tree (45s, 80k entries) and watches for
-    // silent workers (20s). Do not abort the scan cycle prematurely with a
-    // low deadline that drops the queue before finding the large artifacts.
-    let cands = walk::scan_with(cfg, None, true, None);
+    let low_now = (cfg.low_watermark_gib * GIB as f64) as u64;
+    let deadline = if d.free < low_now || d.used_percent() >= 90.0 {
+        Some(Duration::from_secs(45))
+    } else {
+        Some(Duration::from_secs(120))
+    };
+    let cands = walk::scan_with(cfg, None, true, deadline);
     rep.scanned = cands.len();
 
     // seen.db (P2.1): LRU by last-seen, persisted every cycle
@@ -114,7 +131,7 @@ pub fn run_cycle_sampling(cfg: &Config, mut sample_disk: impl FnMut() -> crate::
     rep.action = Some(action.clone());
     if let CycleAction::Evict { need_bytes, cap_bytes, cap_items } = action {
         let rl = Duration::from_secs(cfg.daemon.rate_limit_secs);
-        if rate_limited(seen.last_eviction, SystemTime::now(), rl) {
+        if !force && rate_limited(seen.last_eviction, SystemTime::now(), rl) {
             rep.rate_limited = true;
         } else if need_bytes > 0 {
             let packed = plan::pack_capped(items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
@@ -135,6 +152,11 @@ pub fn run_cycle_sampling(cfg: &Config, mut sample_disk: impl FnMut() -> crate::
                         &evicted_body(&removed, out.freed),
                         Some(&crate::config::expand(&cfg.ledger)),
                     );
+                }
+            }
+            for (p, why) in &out.skipped {
+                if why.starts_with("in use") {
+                    seen.mark_active(p, SystemTime::now());
                 }
             }
             rep.skipped = out.skipped;

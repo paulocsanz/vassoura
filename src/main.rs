@@ -312,17 +312,22 @@ fn cmd_clean(
 const PROBE_INTERVAL_SECS: u64 = 30;
 
 fn cmd_daemon(cfg: &config::Config, once: bool) -> Result<ExitCode, String> {
+    let mut force_next = disk_of(cfg).used_percent() >= 95.0;
     loop {
-        let rep = daemon::run_cycle(cfg);
+        let rep = if force_next {
+            daemon::run_cycle_forced(cfg)
+        } else {
+            daemon::run_cycle(cfg)
+        };
         print_cycle(cfg, &rep);
         if once {
             return Ok(ExitCode::SUCCESS);
         }
-        wait_between_cycles(cfg, &rep);
+        force_next = wait_between_cycles(cfg, &rep);
     }
 }
 
-fn wait_between_cycles(cfg: &config::Config, last_rep: &daemon::CycleReport) {
+fn wait_between_cycles(cfg: &config::Config, _last_rep: &daemon::CycleReport) -> bool {
     let routine_interval = std::time::Duration::from_secs(cfg.watch_interval_secs.max(1));
     let probe_interval = std::time::Duration::from_secs(PROBE_INTERVAL_SECS);
     let start = std::time::Instant::now();
@@ -335,22 +340,17 @@ fn wait_between_cycles(cfg: &config::Config, last_rep: &daemon::CycleReport) {
         }
 
         let d = disk_of(cfg);
-        let low_bytes = (cfg.low_watermark_gib * GIB as f64) as u64;
-        let is_over_capacity = d.used_percent() >= 95.0;
-        let is_under_watermark = d.free < low_bytes;
-
-        if is_over_capacity || is_under_watermark {
-            if last_rep.rate_limited && !is_over_capacity && d.free >= last_rep.free_after {
-                continue;
-            }
+        if d.used_percent() >= 95.0 {
             println!(
-                "  → fast probe: {} free ({:.1}% used) · waking daemon immediately",
+                "  → fast probe: {} free ({:.1}% used >= 95%) · waking daemon to act immediately",
                 human(d.free),
                 d.used_percent()
             );
-            break;
+            let _ = std::io::stdout().flush();
+            return true;
         }
     }
+    false
 }
 
 fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
@@ -380,6 +380,7 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
     for (p, why) in &rep.skipped {
         println!("  skipped: {} — {why}", p.display());
     }
+    let _ = std::io::stdout().flush();
 }
 
 fn cmd_tools(cfg: &config::Config, apply: bool, yes: bool) -> Result<ExitCode, String> {

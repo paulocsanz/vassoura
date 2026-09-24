@@ -63,7 +63,7 @@ fn default_max_items_per_cycle() -> usize {
     200
 }
 fn default_rate_limit_secs() -> u64 {
-    900
+    60
 }
 fn default_notify() -> bool {
     true
@@ -345,7 +345,7 @@ ollama = false
         assert!(!cfg.daemon.notify);
         assert_eq!(cfg.daemon.max_items_per_cycle, 200);
         assert_eq!(cfg.daemon.max_bytes_per_cycle_gib, 80.0);
-        assert_eq!(cfg.daemon.rate_limit_secs, 900);
+        assert_eq!(cfg.daemon.rate_limit_secs, 60);
         assert!(!cfg.tools.ollama);
         assert_eq!(cfg.tools.rustup_keep, 3);
     }
