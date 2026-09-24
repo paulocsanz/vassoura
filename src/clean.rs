@@ -20,7 +20,12 @@ pub struct Outcome {
 ///    after the scan, eviction is aborted for that item;
 /// 4. every successful removal is born with a ledger line.
 pub fn apply(items: &[PlanItem], ledger_path: &Path) -> Outcome {
-    apply_with(items, ledger_path, &crate::gates::in_use)
+    // One lsof snapshot and one git status per repo, each with a kill
+    // timeout. Per-candidate lsof/+D and git status serialized the cycle
+    // behind a single wedged command.
+    let paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
+    let gates = crate::gates::prepare(&paths);
+    apply_with(items, ledger_path, &|p| gates.check(p))
 }
 
 /// `apply` with an injectable in-use predicate (deterministic tests).

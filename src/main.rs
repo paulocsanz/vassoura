@@ -85,6 +85,12 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // Worker processes of the parallel scan. Must run before clap: the
+    // parent kills this process if it stops heartbeating.
+    if std::env::args().nth(1).as_deref() == Some("--scan-worker") {
+        vassoura::scan_pool::worker_main();
+        return ExitCode::SUCCESS;
+    }
     let cli = Cli::parse();
     let (cfg, cfg_path) = match config::load(cli.config.as_deref()) {
         Ok(v) => v,
@@ -162,8 +168,9 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
     let d = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
+    let tight_override = (d.free < low).then_some(cfg.min_age_days_tight);
     let cands = walk::scan(cfg, None, false);
-    let (items, rejected) = plan::build(cands, cfg, None);
+    let (items, rejected) = plan::build(cands, cfg, tight_override);
     let eligible: u64 = items.iter().map(|i| i.cand.bytes).sum();
     let report = statusfs::build_report(d, cfg, eligible, items.len());
 
@@ -177,7 +184,13 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
         "watermarks: low {} GiB (daemon trigger) · high target {} GiB",
         cfg.low_watermark_gib, cfg.until_free_gib
     );
-    let verdict = if d.free < low { "CRITICAL — below the low watermark" } else if d.free < high { "TIGHT — a clean plan fits" } else { "OK — inside the band" };
+    let verdict = if d.free < low {
+        format!("CRITICAL — below the low watermark (tight mode: {}d min age)", cfg.min_age_days_tight)
+    } else if d.free < high {
+        "TIGHT — a clean plan fits".to_string()
+    } else {
+        "OK — inside the band".to_string()
+    };
     println!("state: {verdict}");
 
     let rej: u64 = rejected.iter().map(|r| r.bytes).sum();
@@ -208,14 +221,24 @@ fn cmd_clean(
     until_free: Option<f64>,
     top: usize,
 ) -> Result<ExitCode, String> {
+    let d_init = disk_of(cfg);
+    let low = (cfg.low_watermark_gib * GIB as f64) as u64;
+    let is_tight = older_than.is_none() && d_init.free < low;
+    let effective_older_than = older_than.or_else(|| (d_init.free < low).then_some(cfg.min_age_days_tight));
     let until = until_free.unwrap_or(cfg.until_free_gib);
     let cands = walk::scan(cfg, root, false);
-    let (items, rejected) = plan::build(cands, cfg, older_than);
+    let (items, rejected) = plan::build(cands, cfg, effective_older_than);
     // Re-stat after the scan: the plan uses free space now. The walk is long
     // and the disk moves during it — the same bug as the daemon cycle.
     let d = disk_of(cfg);
     let packed = plan::pack(items, d.free, until, top);
 
+    if is_tight {
+        println!(
+            "# tight mode active (< {:.0} GiB watermark): using min age {}d",
+            cfg.low_watermark_gib, cfg.min_age_days_tight
+        );
+    }
     println!("eviction plan (LRU: oldest first) — target: {until} GiB free");
     println!("{:<10} {:>7}  {:<24} PATH", "SIZE", "AGE(d)", "REGEN");
     for i in &packed.items {
@@ -286,15 +309,47 @@ fn cmd_clean(
     Ok(ExitCode::SUCCESS)
 }
 
+const PROBE_INTERVAL_SECS: u64 = 30;
+
 fn cmd_daemon(cfg: &config::Config, once: bool) -> Result<ExitCode, String> {
-    let interval = std::time::Duration::from_secs(cfg.watch_interval_secs.max(1));
     loop {
         let rep = daemon::run_cycle(cfg);
         print_cycle(cfg, &rep);
         if once {
             return Ok(ExitCode::SUCCESS);
         }
-        std::thread::sleep(interval);
+        wait_between_cycles(cfg, &rep);
+    }
+}
+
+fn wait_between_cycles(cfg: &config::Config, last_rep: &daemon::CycleReport) {
+    let routine_interval = std::time::Duration::from_secs(cfg.watch_interval_secs.max(1));
+    let probe_interval = std::time::Duration::from_secs(PROBE_INTERVAL_SECS);
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < routine_interval {
+        let remaining = routine_interval.saturating_sub(start.elapsed());
+        std::thread::sleep(probe_interval.min(remaining));
+        if start.elapsed() >= routine_interval {
+            break;
+        }
+
+        let d = disk_of(cfg);
+        let low_bytes = (cfg.low_watermark_gib * GIB as f64) as u64;
+        let is_over_capacity = d.used_percent() >= 95.0;
+        let is_under_watermark = d.free < low_bytes;
+
+        if is_over_capacity || is_under_watermark {
+            if last_rep.rate_limited && !is_over_capacity && d.free >= last_rep.free_after {
+                continue;
+            }
+            println!(
+                "  → fast probe: {} free ({:.1}% used) · waking daemon immediately",
+                human(d.free),
+                d.used_percent()
+            );
+            break;
+        }
     }
 }
 
@@ -321,9 +376,9 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
             human(rep.freed),
             config::expand(&cfg.ledger).display()
         );
-        for (p, why) in &rep.skipped {
-            println!("  skipped: {} — {why}", p.display());
-        }
+    }
+    for (p, why) in &rep.skipped {
+        println!("  skipped: {} — {why}", p.display());
     }
 }
 

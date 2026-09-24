@@ -77,18 +77,30 @@ pub fn run_cycle_sampling(cfg: &Config, mut sample_disk: impl FnMut() -> crate::
     let d = sample_disk();
     rep.free_before = d.free;
 
-    let cands = walk::scan(cfg, None, true);
+    // The worker pool bounds each tree (45s, 80k entries) and watches for
+    // silent workers (20s). Do not abort the scan cycle prematurely with a
+    // low deadline that drops the queue before finding the large artifacts.
+    let cands = walk::scan_with(cfg, None, true, None);
     rep.scanned = cands.len();
 
     // seen.db (P2.1): LRU by last-seen, persisted every cycle
     let mut seen = SeenDb::load(&crate::config::expand(&cfg.seen_db));
     seen.refresh(&cands, SystemTime::now());
 
-    let (items, _rejected) = plan::build_seen(cands, cfg, None, &seen);
-    rep.eligible_bytes = items.iter().map(|i| i.cand.bytes).sum();
-
-    // re-stat: the decision and statusfs use the disk now, not before the scan
+    // re-stat: the decision, statusfs and tight min-age use the disk now,
+    // not before the scan
     let d_now = sample_disk();
+    let low = (cfg.low_watermark_gib * GIB as f64) as u64;
+    let high = (cfg.until_free_gib * GIB as f64) as u64;
+
+    let min_override = if d_now.free < low {
+        Some(cfg.min_age_days_tight)
+    } else {
+        None
+    };
+
+    let (items, _rejected) = plan::build_seen(cands, cfg, min_override, &seen);
+    rep.eligible_bytes = items.iter().map(|i| i.cand.bytes).sum();
 
     // status fs (P2.2): the same values as `status --json`
     let report: StatusReport =
@@ -97,8 +109,6 @@ pub fn run_cycle_sampling(cfg: &Config, mut sample_disk: impl FnMut() -> crate::
         eprintln!("# warning: statusfs {}: {e}", cfg.status_dir.display());
     }
 
-    let low = (cfg.low_watermark_gib * GIB as f64) as u64;
-    let high = (cfg.until_free_gib * GIB as f64) as u64;
     let cap_bytes = (cfg.daemon.max_bytes_per_cycle_gib * GIB as f64) as u64;
     let action = decide_cycle(d_now.free, low, high, cap_bytes, cfg.daemon.max_items_per_cycle);
     rep.action = Some(action.clone());

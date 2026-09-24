@@ -7,6 +7,8 @@ pub mod gates;
 pub mod launchd;
 pub mod ledger;
 pub mod plan;
+pub mod procutil;
+pub mod scan_pool;
 pub mod seen;
 pub mod statusfs;
 pub mod tools;

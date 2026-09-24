@@ -146,12 +146,19 @@ pub struct Config {
     pub min_age_days_artifacts: u64,
     /// Minimum age (days) for an app cache (~/Library/Caches etc.).
     pub min_age_days_app_caches: u64,
+    /// Minimum age (days) when disk is tight (< low_watermark). Default: 1.
+    #[serde(default = "default_min_age_days_tight")]
+    pub min_age_days_tight: u64,
     /// Roots where build artifacts are hunted (allowlist — nothing outside is touched).
     pub artifact_roots: Vec<PathBuf>,
     /// Roots whose children are app caches (allowlist).
     pub app_cache_roots: Vec<PathBuf>,
     /// Directory names treated as artifacts.
     pub artifact_names: Vec<String>,
+}
+
+fn default_min_age_days_tight() -> u64 {
+    1
 }
 
 pub fn home() -> PathBuf {
@@ -197,8 +204,9 @@ impl Default for Config {
             until_free_gib: 100.0,
             low_watermark_gib: 40.0,
             watch_interval_secs: 300,
-            min_age_days_artifacts: 14,
-            min_age_days_app_caches: 30,
+            min_age_days_artifacts: 1,
+            min_age_days_app_caches: 14,
+            min_age_days_tight: 1,
             daemon: DaemonCfg::default(),
             tools: ToolsCfg::default(),
             artifact_roots: vec![software_root()],
@@ -210,10 +218,12 @@ impl Default for Config {
 
 impl Config {
     pub fn min_age_days_for(&self, class: crate::walk::Class, override_min: Option<u64>) -> u64 {
-        override_min.unwrap_or(match class {
-            crate::walk::Class::Artifact => self.min_age_days_artifacts,
-            crate::walk::Class::AppCache => self.min_age_days_app_caches,
-        })
+        match class {
+            crate::walk::Class::Artifact => override_min.unwrap_or(self.min_age_days_artifacts),
+            // App caches do not need to be 1 day even in tight mode; preserve min_age_days_app_caches
+            // unless an explicit CLI override asks for an even higher threshold.
+            crate::walk::Class::AppCache => self.min_age_days_app_caches.max(override_min.unwrap_or(0)),
+        }
     }
 }
 

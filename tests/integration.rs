@@ -32,13 +32,9 @@ fn scan_plan_clean_end_to_end() {
     age_dir(&root.join("velho/node_modules"), 40);
     age_dir(&root.join("velho"), 40);
 
-    // new project: target of 2 days (protected by age)
+    // new project: target created today (protected by age < 1d)
     mkfile(&root.join("novo/Cargo.toml"), 10);
     mkfile(&root.join("novo/target/debug/app"), 2000);
-    age_dir(&root.join("novo/target/debug/app"), 2);
-    age_dir(&root.join("novo/target/debug"), 2);
-    age_dir(&root.join("novo/target"), 2);
-    age_dir(&root.join("novo"), 2);
 
     let cfg = Config {
         ledger: fake_home.join("ledger.jsonl"),
@@ -338,6 +334,33 @@ fn daemon_cycle_idle_between_marks_removes_nothing() {
     assert!(cfg.seen_db.exists(), "cycle persists seen.db");
     let seen = std::fs::read_to_string(&cfg.seen_db).unwrap();
     assert!(seen.contains("velho1/node_modules"), "seen.db records candidates: {seen}");
+}
+
+#[test]
+fn daemon_tight_mode_evicts_younger_candidates_when_critical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    daemon_tree(&root);
+
+    let cfg = Config {
+        low_watermark_gib: 1_000_000.0, // critical
+        until_free_gib: 2_000_000.0,
+        min_age_days_artifacts: 3,
+        min_age_days_tight: 1,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 10,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let rep = vassoura::daemon::run_cycle(&cfg);
+    // In tight mode, novo/target (2 days old) is >= 1d, so it's evicted alongside the 3 old ones
+    assert_eq!(rep.removed, 4, "all 4 candidates evicted including 2-day-old target under tight mode");
+    assert!(!root.join("novo/target").exists());
 }
 
 // ---------------------------------------------------------------- P2.1/P2.2
