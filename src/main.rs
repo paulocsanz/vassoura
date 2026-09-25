@@ -377,8 +377,11 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
             config::expand(&cfg.ledger).display()
         );
     }
-    for (p, why) in &rep.skipped {
+    for (p, why) in rep.skipped.iter().take(10) {
         println!("  skipped: {} — {why}", p.display());
+    }
+    if rep.skipped.len() > 10 {
+        println!("  ... and {} more skipped items", rep.skipped.len() - 10);
     }
     let _ = std::io::stdout().flush();
 }

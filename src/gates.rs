@@ -242,10 +242,17 @@ fn lsof_cwd_timeout(path: &Path) -> Result<bool, String> {
 }
 
 fn open_under(opens: &[PathBuf], dir: &Path) -> bool {
+    if opens.iter().any(|p| p == dir || p.starts_with(dir)) {
+        return true;
+    }
     // lsof returns the resolved path (`/private/tmp` for `/tmp`,
-    // `/private/var/folders` for `/var/folders`). Compare both forms.
-    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    opens.iter().any(|p| p == dir || p.starts_with(dir) || p == &canon || p.starts_with(&canon))
+    // `/private/var/folders` for `/var/folders`). Compare both forms if canon diverges.
+    if let Ok(canon) = std::fs::canonicalize(dir) {
+        if canon != dir {
+            return opens.iter().any(|p| p == &canon || p.starts_with(&canon));
+        }
+    }
+    false
 }
 
 #[cfg(test)]

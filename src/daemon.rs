@@ -134,8 +134,21 @@ pub fn run_cycle_sampling_opts(
         if !force && rate_limited(seen.last_eviction, SystemTime::now(), rl) {
             rep.rate_limited = true;
         } else if need_bytes > 0 {
-            let packed = plan::pack_capped(items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
-            let out = clean::apply(&packed.items, &crate::config::expand(&cfg.ledger));
+            let candidate_paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
+            let gates = crate::gates::prepare(&candidate_paths);
+
+            let mut free_items = Vec::new();
+            for item in items {
+                if let Some(why) = gates.check(&item.cand.path) {
+                    seen.mark_active(&item.cand.path, SystemTime::now());
+                    rep.skipped.push((item.cand.path.clone(), why));
+                } else {
+                    free_items.push(item);
+                }
+            }
+
+            let packed = plan::pack_capped(free_items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
+            let out = clean::apply_with(&packed.items, &crate::config::expand(&cfg.ledger), &|p| gates.check(p));
             rep.removed = out.removed;
             rep.freed = out.freed;
             if out.removed > 0 {
@@ -159,7 +172,7 @@ pub fn run_cycle_sampling_opts(
                     seen.mark_active(p, SystemTime::now());
                 }
             }
-            rep.skipped = out.skipped;
+            rep.skipped.extend(out.skipped);
         }
     }
 

@@ -24,6 +24,8 @@ pub fn plist_content(bin: &Path, config: &Path, interval_secs: u64, home: &Path)
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <true/>
     <key>StartInterval</key>
     <integer>{interval_secs}</integer>
     <key>StandardOutPath</key>
@@ -70,5 +72,6 @@ mod tests {
         assert!(s.contains("<string>/Users/t/.vassoura/config.toml</string>"));
         assert!(s.contains("<integer>300</integer>"));
         assert!(s.contains("<key>RunAtLoad</key>"));
+        assert!(s.contains("<key>KeepAlive</key>"));
     }
 }

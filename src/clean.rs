@@ -53,7 +53,7 @@ pub fn apply_with(
             out.skipped.push((path.clone(), "changed since the scan (kept)".into()));
             continue;
         }
-        match fs::remove_dir_all(path) {
+        match remove_dir_all_writable(path) {
             Ok(()) => {
                 let line = Line {
                     ts: jiff::Timestamp::now().as_second(),
@@ -79,6 +79,42 @@ pub fn apply_with(
         }
     }
     out
+}
+
+fn remove_dir_all_writable(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_writable_recursive(path);
+            fs::remove_dir_all(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn make_writable_recursive(path: &Path) {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.is_symlink() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = md.permissions();
+            let mode = perms.mode();
+            if mode & 0o200 == 0 {
+                perms.set_mode(mode | 0o700);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        if md.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    make_writable_recursive(&entry.path());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
