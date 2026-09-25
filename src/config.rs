@@ -31,7 +31,17 @@ pub const DEFAULT_ARTIFACT_NAMES: &[&str] = &[
 ];
 
 /// Directories never walked during the scan (they are data, never junk).
-pub const PRUNE_DIRS: &[&str] = &[".git", ".fonte"];
+pub const PRUNE_DIRS: &[&str] = &[
+    ".git",
+    ".fonte",
+    ".claude",
+    ".pr-worktrees",
+    "miniforge",
+    "miniforge3",
+    "miniconda",
+    "miniconda3",
+    "anaconda3",
+];
 
 /// Bound and cadence of the daemon eviction cycle.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -158,7 +168,7 @@ pub struct Config {
 }
 
 fn default_min_age_days_tight() -> u64 {
-    1
+    0
 }
 
 pub fn home() -> PathBuf {
@@ -206,7 +216,7 @@ impl Default for Config {
             watch_interval_secs: 300,
             min_age_days_artifacts: 1,
             min_age_days_app_caches: 14,
-            min_age_days_tight: 1,
+            min_age_days_tight: 0,
             daemon: DaemonCfg::default(),
             tools: ToolsCfg::default(),
             artifact_roots: vec![software_root()],
@@ -218,12 +228,10 @@ impl Default for Config {
 
 impl Config {
     pub fn min_age_days_for(&self, class: crate::walk::Class, override_min: Option<u64>) -> u64 {
-        match class {
-            crate::walk::Class::Artifact => override_min.unwrap_or(self.min_age_days_artifacts),
-            // App caches do not need to be 1 day even in tight mode; preserve min_age_days_app_caches
-            // unless an explicit CLI override asks for an even higher threshold.
-            crate::walk::Class::AppCache => self.min_age_days_app_caches.max(override_min.unwrap_or(0)),
-        }
+        override_min.unwrap_or(match class {
+            crate::walk::Class::Artifact => self.min_age_days_artifacts,
+            crate::walk::Class::AppCache => self.min_age_days_app_caches,
+        })
     }
 }
 
