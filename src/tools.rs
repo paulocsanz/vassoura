@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(sel.iter().map(|m| m.name.clone()).collect::<Vec<_>>(), ["llama3:8b", "gemma2:2b"]);
 
         // small need: only the oldest
-        let sel1 = select_ollama(&models, 1 * GIB);
+        let sel1 = select_ollama(&models, GIB);
         assert_eq!(sel1.len(), 1);
         assert_eq!(sel1[0].name, "llama3:8b");
     }

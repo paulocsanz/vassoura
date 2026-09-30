@@ -28,25 +28,33 @@ pub struct Rejected {
 pub fn build(
     cands: Vec<Candidate>,
     cfg: &Config,
-    override_min: Option<u64>,
+    override_min: Option<f64>,
 ) -> (Vec<PlanItem>, Vec<Rejected>) {
     build_inner(cands, cfg, override_min, None)
 }
 
-/// `build` with LRU by last-seen (seen.db, P2.1); with no record, uses mtime.
+/// The daemon path: `build` with LRU by last-seen (seen.db, P2.1) and the
+/// CHURN GUARD — a path evicted less than `CHURN_GUARD_DAYS` ago stays out of
+/// the plan: whatever regenerated it is alive and will keep regenerating it
+/// (measured 2026-09: Firefox cache evicted 42×/week; each round-trip is a
+/// fresh FSEvents storm). The manual `clean` CLI uses plain `build` and is
+/// the human escape hatch.
 pub fn build_seen(
     cands: Vec<Candidate>,
     cfg: &Config,
-    override_min: Option<u64>,
+    override_min: Option<f64>,
     seen: &SeenDb,
 ) -> (Vec<PlanItem>, Vec<Rejected>) {
     build_inner(cands, cfg, override_min, Some(seen))
 }
 
+/// A path evicted this recently is regeneration, not garbage.
+pub const CHURN_GUARD_DAYS: f64 = 7.0;
+
 fn build_inner(
     cands: Vec<Candidate>,
     cfg: &Config,
-    override_min: Option<u64>,
+    override_min: Option<f64>,
     seen: Option<&SeenDb>,
 ) -> (Vec<PlanItem>, Vec<Rejected>) {
     let now = SystemTime::now();
@@ -69,13 +77,30 @@ fn build_inner(
             });
             continue;
         }
+        if let Some(seen) = seen {
+            if let Some(removed_at) = seen.last_removed(&c) {
+                let since = age_days(now, removed_at);
+                if since < CHURN_GUARD_DAYS {
+                    rejected.push(Rejected {
+                        path: c.path.clone(),
+                        bytes: c.bytes,
+                        reason: format!(
+                            "churn guard: evicted {} ago (< {}d) — it regenerated; leave it",
+                            fmt_age_short(since),
+                            CHURN_GUARD_DAYS
+                        ),
+                    });
+                    continue;
+                }
+            }
+        }
         let min = cfg.min_age_days_for(c.class, override_min);
         let age = age_days(now, c.newest_mtime);
-        if age < min as f64 {
+        if age < min {
             rejected.push(Rejected {
                 path: c.path.clone(),
                 bytes: c.bytes,
-                reason: format!("young: {age:.0}d < {min}d"),
+                reason: format!("young: {} < {} min age", fmt_age_short(age), fmt_age_short(min)),
             });
             continue;
         }
@@ -87,6 +112,18 @@ fn build_inner(
         items.push(PlanItem { cand: c, age_days: age, last_used, hint });
     }
     (items, rejected)
+}
+
+/// Compact age for humans: "42m", "3h", "5d" — sub-day minimums were
+/// unreadable as fractions of a day ("0.04d").
+pub fn fmt_age_short(days: f64) -> String {
+    if days < 1.0 / 24.0 {
+        format!("{:.0}m", (days * 1440.0).max(1.0))
+    } else if days < 1.0 {
+        format!("{:.0}h", days * 24.0)
+    } else {
+        format!("{days:.0}d")
+    }
 }
 
 pub struct Packed {

@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn verdicts_match_marks() {
-        let gib = GIB as u64;
+        let gib = GIB;
         assert_eq!(verdict_of(30 * gib, 40 * gib, 100 * gib), "critical");
         assert_eq!(verdict_of(50 * gib, 40 * gib, 100 * gib), "tight");
         assert_eq!(verdict_of(120 * gib, 40 * gib, 100 * gib), "ok");

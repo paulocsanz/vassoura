@@ -19,7 +19,26 @@ pub struct SeenEntry {
     pub last_seen: SystemTime,
     /// Fingerprint of the previous cycle (newest mtime seen).
     pub last_mtime: SystemTime,
+    /// When the daemon last evicted this path (churn-guard input). `None`
+    /// for old records written before the field existed.
+    pub last_removed: Option<SystemTime>,
 }
+
+/// One completed destructive cycle: when it ended and the free space right
+/// after it. The daemon's churn breaker compares these samples across
+/// cycles: if free space after eviction keeps coming back flat, what the
+/// daemon deletes is being regenerated and eviction must stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvictionSample {
+    /// End of the cycle (nanos since the epoch).
+    pub at: u64,
+    /// Free bytes measured right after the cycle.
+    pub free_after: u64,
+}
+
+/// How many eviction samples are kept (a small ring; the breaker looks at
+/// the last few cycles only).
+pub const HISTORY_CAP: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SeenDb {
@@ -27,6 +46,12 @@ pub struct SeenDb {
     pub last_eviction: Option<SystemTime>,
     /// path → record.
     pub entries: HashMap<String, SeenEntry>,
+    /// Recent destructive cycles (churn-breaker input), bounded ring.
+    pub eviction_history: Vec<EvictionSample>,
+    /// Eviction suspended until this instant (churn breaker tripped).
+    pub backoff_until: Option<SystemTime>,
+    /// Consecutive breaker trips (backoff escalation: 1h, 2h, 4h … 24h cap).
+    pub backoff_count: u32,
 }
 
 fn to_nanos(t: SystemTime) -> u64 {
@@ -41,6 +66,8 @@ fn from_nanos(n: u64) -> SystemTime {
 struct SeenEntryJson {
     last_seen: u64,
     last_mtime: u64,
+    #[serde(default)]
+    last_removed: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -48,6 +75,12 @@ struct SeenDbJson {
     version: u32,
     last_eviction: Option<u64>,
     entries: HashMap<String, SeenEntryJson>,
+    #[serde(default)]
+    eviction_history: Vec<EvictionSample>,
+    #[serde(default)]
+    backoff_until: Option<u64>,
+    #[serde(default)]
+    backoff_count: u32,
 }
 
 impl SeenDb {
@@ -69,10 +102,14 @@ impl SeenDb {
                         SeenEntry {
                             last_seen: from_nanos(v.last_seen),
                             last_mtime: from_nanos(v.last_mtime),
+                            last_removed: v.last_removed.map(from_nanos),
                         },
                     )
                 })
                 .collect(),
+            eviction_history: j.eviction_history,
+            backoff_until: j.backoff_until.map(from_nanos),
+            backoff_count: j.backoff_count,
         }
     }
 
@@ -92,10 +129,14 @@ impl SeenDb {
                         SeenEntryJson {
                             last_seen: to_nanos(v.last_seen),
                             last_mtime: to_nanos(v.last_mtime),
+                            last_removed: v.last_removed.map(to_nanos),
                         },
                     )
                 })
                 .collect(),
+            eviction_history: self.eviction_history.clone(),
+            backoff_until: self.backoff_until.map(to_nanos),
+            backoff_count: self.backoff_count,
         };
         // atomic write: temp + rename in the same directory
         let tmp = path.with_extension("db.tmp");
@@ -119,7 +160,11 @@ impl SeenDb {
                 None => {
                     self.entries.insert(
                         key,
-                        SeenEntry { last_seen: c.newest_mtime, last_mtime: c.newest_mtime },
+                        SeenEntry {
+                            last_seen: c.newest_mtime,
+                            last_mtime: c.newest_mtime,
+                            last_removed: None,
+                        },
                     );
                 }
             }
@@ -146,7 +191,74 @@ impl SeenDb {
         if let Some(e) = self.entries.get_mut(&key) {
             e.last_seen = now;
         } else {
-            self.entries.insert(key, SeenEntry { last_seen: now, last_mtime: now });
+            self.entries.insert(key, SeenEntry { last_seen: now, last_mtime: now, last_removed: None });
+        }
+    }
+
+    /// When the daemon last evicted this exact path (churn-guard input).
+    pub fn last_removed(&self, cand: &Candidate) -> Option<SystemTime> {
+        self.entries.get(&cand.path.display().to_string()).and_then(|e| e.last_removed)
+    }
+
+    /// Record an eviction of this exact path (churn-guard input: the daemon
+    /// must not come back for what it just harvested until it had time to
+    /// prove itself cold — 7 days — not minutes).
+    pub fn mark_removed(&mut self, path: &Path, now: SystemTime) {
+        let key = path.display().to_string();
+        let e = self
+            .entries
+            .entry(key)
+            .or_insert(SeenEntry { last_seen: now, last_mtime: now, last_removed: None });
+        e.last_removed = Some(now);
+    }
+
+    /// One completed destructive CYCLE (not per path — a cycle that removes
+    /// 200 items is still one sample) with the free space it actually bought.
+    pub fn record_eviction_sample(&mut self, at: SystemTime, free_after: u64) {
+        self.eviction_history.push(EvictionSample { at: to_nanos(at), free_after });
+        if self.eviction_history.len() > HISTORY_CAP {
+            let cut = self.eviction_history.len() - HISTORY_CAP;
+            self.eviction_history.drain(0..cut);
+        }
+    }
+
+    /// Remaining backoff, if eviction is currently suspended. A pause of
+    /// zero length is expiry, not backoff.
+    pub fn in_backoff(&self, now: SystemTime) -> Option<std::time::Duration> {
+        self.backoff_until
+            .and_then(|until| until.duration_since(now).ok())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    /// Trip the breaker: suspend eviction, doubling the pause on each
+    /// consecutive trip (1h, 2h, 4h … capped). Returns the pause taken.
+    pub fn trip_backoff(
+        &mut self,
+        now: SystemTime,
+        base: std::time::Duration,
+        cap: std::time::Duration,
+    ) -> std::time::Duration {
+        self.backoff_count = self.backoff_count.saturating_add(1);
+        let shift = (self.backoff_count - 1).min(5);
+        let pause = base.saturating_mul(1u32 << shift).min(cap);
+        self.backoff_until = Some(now + pause);
+        pause
+    }
+
+    /// A destructive cycle made real progress: end the escalation (keep the
+    /// history — it is the current evidence for the next window).
+    pub fn reset_backoff_escalation(&mut self) {
+        self.backoff_count = 0;
+    }
+
+    /// A destructive cycle made real progress (or the disk recovered):
+    /// eviction resumes and the escalation restarts from the base pause.
+    pub fn clear_backoff(&mut self) {
+        if self.backoff_until.is_some() || self.backoff_count > 0 || !self.eviction_history.is_empty()
+        {
+            self.backoff_until = None;
+            self.backoff_count = 0;
+            self.eviction_history.clear();
         }
     }
 }
@@ -244,7 +356,7 @@ mod tests {
         // `virgem`: mtime 90d, never seen → mtime fallback
         let virgem = cand("/virgem", 90 * 86400);
 
-        let mut keyed = vec![
+        let mut keyed = [
             ("/restored", db.last_used(&restored)),
             ("/virgem", db.last_used(&virgem)),
         ];
@@ -260,5 +372,62 @@ mod tests {
         let now = SystemTime::now();
         db.mark_active(Path::new("/in/use"), now);
         assert_eq!(db.last_used(&c), now);
+    }
+
+    #[test]
+    fn churn_guard_state_round_trips_and_old_db_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("seen.db");
+        let mut db = SeenDb::default();
+        let now = SystemTime::now();
+        db.mark_removed(Path::new("/x/nm"), now);
+        db.record_eviction_sample(now, 12 * 1024 * 1024 * 1024);
+        db.persist(&p).unwrap();
+        let back = SeenDb::load(&p);
+        assert_eq!(back.last_removed(&cand("/x/nm", 50)), Some(now));
+        assert_eq!(back.eviction_history.len(), 1);
+
+        // seen.db written by a pre-churn-guard version: no new keys at all.
+        let old = tmp.path().join("old.db");
+        std::fs::write(
+            &old,
+            r#"{"version":1,"last_eviction":100,"entries":{"/a":{"last_seen":5,"last_mtime":5}}}"#,
+        )
+        .unwrap();
+        let legacy = SeenDb::load(&old);
+        assert_eq!(legacy.entries.len(), 1);
+        assert_eq!(legacy.last_removed(&cand("/a", 5)), None);
+        assert!(legacy.eviction_history.is_empty());
+        assert_eq!(legacy.backoff_until, None);
+    }
+
+    #[test]
+    fn history_is_a_bounded_ring() {
+        let mut db = SeenDb::default();
+        let t0 = SystemTime::now();
+        for i in 0..(HISTORY_CAP + 4) {
+            db.record_eviction_sample(t0, i as u64);
+        }
+        assert_eq!(db.eviction_history.len(), HISTORY_CAP);
+        assert_eq!(db.eviction_history.last().unwrap().free_after, (HISTORY_CAP + 3) as u64);
+    }
+
+    #[test]
+    fn backoff_escalates_doubles_and_caps() {
+        let mut db = SeenDb::default();
+        let now = SystemTime::now();
+        let base = std::time::Duration::from_secs(3600);
+        let cap = std::time::Duration::from_secs(24 * 3600);
+        assert_eq!(db.trip_backoff(now, base, cap), std::time::Duration::from_secs(3600));
+        assert_eq!(db.trip_backoff(now, base, cap), std::time::Duration::from_secs(2 * 3600));
+        assert_eq!(db.trip_backoff(now, base, cap), std::time::Duration::from_secs(4 * 3600));
+        assert_eq!(db.in_backoff(now), Some(std::time::Duration::from_secs(4 * 3600)));
+        for _ in 0..10 {
+            db.trip_backoff(now, base, cap);
+        }
+        assert_eq!(db.backoff_until, Some(now + cap), "pause caps at 24h, no overflow");
+        assert!(db.in_backoff(now + cap).is_none(), "backoff expires");
+        db.clear_backoff();
+        assert_eq!((db.backoff_until, db.backoff_count, db.eviction_history.len()), (None, 0, 0));
     }
 }

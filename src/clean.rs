@@ -188,7 +188,7 @@ mod tests {
         let ledger = tmp.path().join("ledger.jsonl");
 
         let gate = |p: &std::path::Path| {
-            (p == &a).then(|| "in use: process has a file open".to_string())
+            (*p == a).then(|| "in use: process has a file open".to_string())
         };
         let out = apply_with(std::slice::from_ref(&it), &ledger, &gate);
 

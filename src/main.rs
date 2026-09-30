@@ -185,7 +185,11 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
         cfg.low_watermark_gib, cfg.until_free_gib
     );
     let verdict = if d.free < low {
-        format!("CRITICAL — below the low watermark (tight mode: {}d min age)", cfg.min_age_days_tight)
+        format!(
+            "CRITICAL — below the low watermark (tight mode: {} min age; hard floor {})",
+            plan::fmt_age_short(cfg.tight_min_age()),
+            plan::fmt_age_short(vassoura::config::MIN_AGE_FLOOR_DAYS)
+        )
     } else if d.free < high {
         "TIGHT — a clean plan fits".to_string()
     } else {
@@ -224,7 +228,9 @@ fn cmd_clean(
     let d_init = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let is_tight = older_than.is_none() && d_init.free < low;
-    let effective_older_than = older_than.or_else(|| (d_init.free < low).then_some(cfg.min_age_days_tight));
+    let effective_older_than = older_than
+        .map(|d| d as f64)
+        .or_else(|| (d_init.free < low).then_some(cfg.min_age_days_tight));
     let until = until_free.unwrap_or(cfg.until_free_gib);
     let cands = walk::scan(cfg, root, false);
     let (items, rejected) = plan::build(cands, cfg, effective_older_than);
@@ -235,8 +241,10 @@ fn cmd_clean(
 
     if is_tight {
         println!(
-            "# tight mode active (< {:.0} GiB watermark): using min age {}d",
-            cfg.low_watermark_gib, cfg.min_age_days_tight
+            "# tight mode active (< {:.0} GiB watermark): using min age {} (hard floor {})",
+            cfg.low_watermark_gib,
+            plan::fmt_age_short(cfg.tight_min_age()),
+            plan::fmt_age_short(vassoura::config::MIN_AGE_FLOOR_DAYS)
         );
     }
     println!("eviction plan (LRU: oldest first) — target: {until} GiB free");
@@ -361,13 +369,14 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
         }
     };
     println!(
-        "cycle: {} candidates · eligible {} · free {} → {} · {}{}",
+        "cycle: {} candidates · eligible {} · free {} → {} · {}{}{}",
         rep.scanned,
         human(rep.eligible_bytes),
         human(rep.free_before),
         human(rep.free_after),
         action,
-        if rep.rate_limited { " [rate-limited: holding this cycle]" } else { "" }
+        if rep.rate_limited { " [rate-limited: holding this cycle]" } else { "" },
+        if rep.backoff { " [BACKOFF: churn breaker holding evictions]" } else { "" }
     );
     if rep.removed > 0 {
         println!(

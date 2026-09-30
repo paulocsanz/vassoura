@@ -258,7 +258,7 @@ fn daemon_cycle_triggers_bounded_and_ledgers_each_removal() {
         assert!(v["hint"].as_str().unwrap().contains("install"), "regeneration hint: {}", v["hint"]);
     }
 
-    // immediate second cycle: rate-limit holds (default 900s)
+    // immediate second cycle: rate-limit holds (default 300s)
     let cfg2 = Config { low_watermark_gib: 1_000_000.0, until_free_gib: 2_000_000.0, ..cfg.clone() };
     let rep2 = vassoura::daemon::run_cycle(&cfg2);
     assert!(rep2.rate_limited, "eviction seconds ago → rate-limited");
@@ -348,7 +348,7 @@ fn daemon_tight_mode_evicts_younger_candidates_when_critical() {
         low_watermark_gib: 1_000_000.0, // critical
         until_free_gib: 2_000_000.0,
         min_age_days_artifacts: 3,
-        min_age_days_tight: 1,
+        min_age_days_tight: 1.0,
         daemon: vassoura::config::DaemonCfg {
             max_items_per_cycle: 10,
             notify: false,
@@ -361,6 +361,142 @@ fn daemon_tight_mode_evicts_younger_candidates_when_critical() {
     // In tight mode, novo/target (2 days old) is >= 1d, so it's evicted alongside the 3 old ones
     assert_eq!(rep.removed, 4, "all 4 candidates evicted including 2-day-old target under tight mode");
     assert!(!root.join("novo/target").exists());
+}
+
+// ------------------------------------------------- 2026-09 incident regressions
+// min_age_days_tight = 0 + an unreachable target turned the daemon into a
+// delete/recreate machine gun that took the machine down (fseventsd leak).
+
+#[test]
+fn daemon_never_harvests_an_inflight_build_even_with_tight_zero() {
+    // The incident shape: tight mode min age 0, disk "critical", and a
+    // node_modules written minutes ago by a build still in flight. The hard
+    // floor (1h) must hold: young stays, only the cold one leaves.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+
+    // cold project (40d)
+    mkfile(&root.join("velho/package.json"), 20);
+    mkfile(&root.join("velho/node_modules/dep/a.js"), 1000);
+    for p in [&root.join("velho/node_modules/dep/a.js"), &root.join("velho/node_modules/dep"), &root.join("velho/node_modules"), &root.join("velho"), &root] {
+        age_dir(p, 40);
+    }
+    // hot project: written "just now" by an in-flight build
+    mkfile(&root.join("buildando/package.json"), 20);
+    mkfile(&root.join("buildando/node_modules/dep/a.js"), 1000);
+
+    let cfg = Config {
+        low_watermark_gib: 1_000_000.0,
+        until_free_gib: 2_000_000.0,
+        min_age_days_tight: 0.0, // the incident config, verbatim
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 10,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let rep = vassoura::daemon::run_cycle(&cfg);
+    assert_eq!(rep.removed, 1, "only the cold one leaves: {:?}", rep.skipped);
+    assert!(!root.join("velho/node_modules").exists());
+    assert!(root.join("buildando/node_modules").exists(), "an in-flight build is never harvested");
+    let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
+    assert_eq!(ledger.lines().count(), 1);
+}
+
+#[test]
+fn daemon_churn_guard_refuses_to_reevict_what_regenerated() {
+    // Delete → the tool recreates it (aged cold, even) → the daemon must NOT
+    // come back for it within the guard window. That loop was the whole
+    // incident (Firefox cache 42×/week in the ledger).
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    daemon_tree(&root);
+
+    let cfg = Config {
+        low_watermark_gib: 1_000_000.0,
+        until_free_gib: 2_000_000.0,
+        daemon: vassoura::config::DaemonCfg {
+            rate_limit_secs: 0, // the guard is under test, not the rate-limit
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let rep1 = vassoura::daemon::run_cycle(&cfg);
+    assert_eq!(rep1.removed, 4, "first cycle takes everything eligible");
+    assert!(!rep1.backoff);
+
+    // velho1's node_modules is regenerated — and even looks cold (40d)
+    mkfile(&root.join("velho1/package.json"), 20);
+    mkfile(&root.join("velho1/pnpm-lock.yaml"), 20);
+    mkfile(&root.join("velho1/node_modules/dep/a.js"), 1000);
+    for p in [&root.join("velho1/node_modules/dep/a.js"), &root.join("velho1/node_modules/dep"), &root.join("velho1/node_modules"), &root.join("velho1"), &root] {
+        age_dir(p, 40);
+    }
+
+    let rep2 = vassoura::daemon::run_cycle(&cfg);
+    assert_eq!(rep2.removed, 0, "the regenerated directory is churn-guarded");
+    assert!(root.join("velho1/node_modules").exists(), "it stays put");
+    let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
+    assert_eq!(ledger.lines().count(), 4, "no new ledger lines");
+}
+
+#[test]
+fn daemon_churn_breaker_suspends_eviction_when_free_space_goes_nowhere() {
+    // Flat free space across destructive cycles = regeneration churn. After
+    // the window, the breaker must hold evictions — even with a fresh
+    // eligible candidate on the table.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    daemon_tree(&root);
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 1, // one item per cycle → 3 cycles to trip
+            rate_limit_secs: 0,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    // the disk never gets better: 10 GiB free before AND after every cycle
+    let gib = 1024u64 * 1024 * 1024;
+    let flat = move || vassoura::disk::Disk { total: 200 * gib, free: 10 * gib };
+
+    for i in 1..=3 {
+        let rep = vassoura::daemon::run_cycle_sampling(&cfg, flat);
+        assert_eq!(rep.removed, 1, "cycle {i}: one item (bound)");
+        assert_eq!(rep.free_after, 10 * gib, "cycle {i}: eviction bought nothing durable");
+    }
+    // 3 flat samples → the breaker must have tripped (window of 3)
+    let seen = vassoura::seen::SeenDb::load(&cfg.seen_db);
+    assert!(seen.backoff_until.is_some(), "backoff recorded in seen.db");
+    assert_eq!(seen.backoff_count, 1);
+
+    // fresh eligible candidate appears; the held cycle must not touch it
+    mkfile(&root.join("fresco/package.json"), 20);
+    mkfile(&root.join("fresco/node_modules/dep/a.js"), 1000);
+    for p in [&root.join("fresco/node_modules/dep/a.js"), &root.join("fresco/node_modules/dep"), &root.join("fresco/node_modules"), &root.join("fresco"), &root] {
+        age_dir(p, 40);
+    }
+    let rep4 = vassoura::daemon::run_cycle_sampling(&cfg, flat);
+    assert!(rep4.backoff, "cycle 4 is held by the churn breaker");
+    assert_eq!(rep4.removed, 0);
+    assert!(root.join("fresco/node_modules").exists());
+    let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
+    assert_eq!(ledger.lines().count(), 3, "no removal while in backoff");
 }
 
 // ---------------------------------------------------------------- P2.1/P2.2
@@ -433,7 +569,7 @@ fn status_json_contract_and_statusfs_match() {
     assert!(v["watermarks"]["low_gib"].is_f64());
     assert!(v["watermarks"]["high_gib"].is_f64());
     assert_eq!(v["verdict"].as_str().unwrap(), report.verdict);
-    assert_eq!(v["eligible"]["bytes"].as_u64().unwrap(), eligible as u64);
+    assert_eq!(v["eligible"]["bytes"].as_u64().unwrap(), eligible);
     assert_eq!(v["eligible"]["count"].as_u64().unwrap(), items.len() as u64);
 
     // what refresh/daemon writes to the status fs: the same values

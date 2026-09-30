@@ -25,6 +25,36 @@ pub enum CycleAction {
     Evict { need_bytes: u64, cap_bytes: u64, cap_items: usize },
 }
 
+// ---------------------------------------------------------------- churn breaker
+// Incident 2026-09: `until_free_gib` was unreachable (needed 77 GiB, ~26 GiB
+// evictable — all of it regenerating), so the daemon sat in EVICT forever:
+// delete, apps/agents rebuild, delete again, one destructive cycle per
+// minute (ledger: 5401 removals; Firefox cache 42×/week). The FSEvents storm
+// took fseventsd to 84 GiB RSS and the machine thrashed. The breaker makes
+// "evicting is not working" a first-class conclusion instead of a loop.
+
+/// Consecutive destructive cycles the breaker looks at.
+pub const CHURN_WINDOW: usize = 3;
+/// Net free-space gain below which the window counts as "no progress".
+pub const CHURN_MIN_PROGRESS_BYTES: u64 = GIB;
+/// First backoff pause when the breaker trips; doubles on each consecutive
+/// trip, capped at `CHURN_BACKOFF_CAP`.
+pub const CHURN_BACKOFF_BASE: Duration = Duration::from_secs(60 * 60);
+pub const CHURN_BACKOFF_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Trip when the last `CHURN_WINDOW` destructive cycles bought less than
+/// `CHURN_MIN_PROGRESS_BYTES` of durable free space: what the daemon deletes
+/// is coming back between cycles. Regeneration churn, not progress.
+pub fn churn_detected(history: &[crate::seen::EvictionSample]) -> bool {
+    if history.len() < CHURN_WINDOW {
+        return false;
+    }
+    let tail = &history[history.len() - CHURN_WINDOW..];
+    let first = tail[0].free_after;
+    let last = tail[tail.len() - 1].free_after;
+    last.saturating_sub(first) < CHURN_MIN_PROGRESS_BYTES
+}
+
 /// Pure hysteresis decision for the cycle.
 pub fn decide_cycle(free: u64, low_bytes: u64, high_bytes: u64, cap_bytes: u64, cap_items: usize) -> CycleAction {
     if free >= low_bytes {
@@ -54,6 +84,10 @@ pub struct CycleReport {
     pub eligible_bytes: u64,
     pub action: Option<CycleAction>,
     pub rate_limited: bool,
+    /// The churn breaker is holding this cycle (and, if it just tripped,
+    /// every cycle for the next backoff pause): evictions are buying no
+    /// durable free space.
+    pub backoff: bool,
     pub removed: usize,
     pub freed: u64,
     pub skipped: Vec<(std::path::PathBuf, String)>,
@@ -70,8 +104,10 @@ pub fn run_cycle(cfg: &Config) -> CycleReport {
     run_cycle_sampling_opts(cfg, || disk_of(cfg), false)
 }
 
-/// Run cycle with forced eviction (bypasses rate-limiting, e.g. when woken
-/// by fast probe on critical disk usage >= 95%).
+/// Run cycle with forced eviction (skips the rate-limit, e.g. when woken
+/// by fast probe on critical disk usage >= 95%). The churn backoff is
+/// NEVER skipped: a forced cycle that would only feed the regeneration
+/// loop is held like any other.
 pub fn run_cycle_forced(cfg: &Config) -> CycleReport {
     run_cycle_sampling_opts(cfg, || disk_of(cfg), true)
 }
@@ -110,6 +146,12 @@ pub fn run_cycle_sampling_opts(
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
 
+    // The disk left the critical band (space was freed for real): whatever
+    // churn evidence we had belongs to another regime.
+    if d_now.free >= low {
+        seen.clear_backoff();
+    }
+
     let min_override = if d_now.free < low {
         Some(cfg.min_age_days_tight)
     } else {
@@ -129,50 +171,79 @@ pub fn run_cycle_sampling_opts(
     let cap_bytes = (cfg.daemon.max_bytes_per_cycle_gib * GIB as f64) as u64;
     let action = decide_cycle(d_now.free, low, high, cap_bytes, cfg.daemon.max_items_per_cycle);
     rep.action = Some(action.clone());
+    let now = SystemTime::now();
+    let mut free_after_sampled = false;
     if let CycleAction::Evict { need_bytes, cap_bytes, cap_items } = action {
-        let rl = Duration::from_secs(cfg.daemon.rate_limit_secs);
-        if !force && rate_limited(seen.last_eviction, SystemTime::now(), rl) {
-            rep.rate_limited = true;
-        } else if need_bytes > 0 {
-            let candidate_paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
-            let gates = crate::gates::prepare(&candidate_paths);
+        if seen.in_backoff(now).is_some() {
+            // Churn breaker: recent destructive cycles bought no durable free
+            // space — deleting more only feeds the regeneration loop.
+            rep.backoff = true;
+        } else {
+            let rl = Duration::from_secs(cfg.daemon.rate_limit_secs);
+            if !force && rate_limited(seen.last_eviction, now, rl) {
+                rep.rate_limited = true;
+            } else if need_bytes > 0 {
+                let candidate_paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
+                let gates = crate::gates::prepare(&candidate_paths);
 
-            let mut free_items = Vec::new();
-            for item in items {
-                if let Some(why) = gates.check(&item.cand.path) {
-                    seen.mark_active(&item.cand.path, SystemTime::now());
-                    rep.skipped.push((item.cand.path.clone(), why));
-                } else {
-                    free_items.push(item);
+                let mut free_items = Vec::new();
+                for item in items {
+                    if let Some(why) = gates.check(&item.cand.path) {
+                        seen.mark_active(&item.cand.path, SystemTime::now());
+                        rep.skipped.push((item.cand.path.clone(), why));
+                    } else {
+                        free_items.push(item);
+                    }
                 }
-            }
 
-            let packed = plan::pack_capped(free_items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
-            let out = clean::apply_with(&packed.items, &crate::config::expand(&cfg.ledger), &|p| gates.check(p));
-            rep.removed = out.removed;
-            rep.freed = out.freed;
-            if out.removed > 0 {
-                seen.mark_eviction(SystemTime::now());
-                if cfg.daemon.notify {
+                let packed = plan::pack_capped(free_items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
+                let out = clean::apply_with(&packed.items, &crate::config::expand(&cfg.ledger), &|p| gates.check(p));
+                rep.removed = out.removed;
+                rep.freed = out.freed;
+                rep.free_after = sample_disk().free;
+                free_after_sampled = true;
+                if out.removed > 0 {
+                    seen.mark_eviction(now);
                     let removed: Vec<&Path> = packed
                         .items
                         .iter()
                         .map(|i| i.cand.path.as_path())
                         .filter(|p| !out.skipped.iter().any(|(sp, _)| sp == p))
                         .collect();
-                    notify(
-                        "vassoura",
-                        &evicted_body(&removed, out.freed),
-                        Some(&crate::config::expand(&cfg.ledger)),
-                    );
+                    for p in &removed {
+                        seen.mark_removed(p, now);
+                    }
+                    // one sample per destructive CYCLE: its actual outcome
+                    seen.record_eviction_sample(now, rep.free_after);
+                    if churn_detected(&seen.eviction_history) {
+                        let pause = seen.trip_backoff(now, CHURN_BACKOFF_BASE, CHURN_BACKOFF_CAP);
+                        rep.backoff = true;
+                        if cfg.daemon.notify {
+                            notify(
+                                "vassoura — evictions suspended",
+                                &churn_body(pause, cfg),
+                                Some(&crate::config::expand(&cfg.ledger)),
+                            );
+                        }
+                    } else {
+                        // this cycle bought durable space: end the escalation
+                        seen.reset_backoff_escalation();
+                        if cfg.daemon.notify {
+                            notify(
+                                "vassoura",
+                                &evicted_body(&removed, out.freed),
+                                Some(&crate::config::expand(&cfg.ledger)),
+                            );
+                        }
+                    }
                 }
-            }
-            for (p, why) in &out.skipped {
-                if why.starts_with("in use") {
-                    seen.mark_active(p, SystemTime::now());
+                for (p, why) in &out.skipped {
+                    if why.starts_with("in use") {
+                        seen.mark_active(p, SystemTime::now());
+                    }
                 }
+                rep.skipped.extend(out.skipped);
             }
-            rep.skipped.extend(out.skipped);
         }
     }
 
@@ -180,8 +251,23 @@ pub fn run_cycle_sampling_opts(
         eprintln!("# warning: seen.db {}: {e}", cfg.seen_db.display());
     }
 
-    rep.free_after = sample_disk().free;
+    if !free_after_sampled {
+        rep.free_after = sample_disk().free;
+    }
     rep
+}
+
+/// Notification body when the breaker trips: say WHY eviction stopped and
+/// what to do about it — an unreachable target is a human problem.
+pub fn churn_body(pause: Duration, cfg: &Config) -> String {
+    format!(
+        "last {} eviction cycles bought no durable free space (regeneration churn) — \
+         evictions suspended for {}h. The {} GiB free target may be unreachable: \
+         lower until_free_gib or free space manually.",
+        CHURN_WINDOW,
+        pause.as_secs() / 3600,
+        cfg.until_free_gib
+    )
 }
 
 /// Disk of the first allowlist root (fallback: /).
@@ -273,6 +359,32 @@ mod tests {
         assert!(rate_limited(Some(now), now, rl));
         assert!(rate_limited(Some(now - Duration::from_secs(600)), now, rl));
         assert!(!rate_limited(Some(now - Duration::from_secs(901)), now, rl));
+    }
+
+    fn sample(free_after: u64) -> crate::seen::EvictionSample {
+        crate::seen::EvictionSample { at: 0, free_after }
+    }
+
+    #[test]
+    fn churn_breaker_trips_on_flat_free_space_only() {
+        // fewer cycles than the window: no verdict
+        assert!(!churn_detected(&[]));
+        assert!(!churn_detected(&[sample(20 * G), sample(20 * G)]));
+        // the incident: free after eviction goes nowhere across the window
+        assert!(churn_detected(&[sample(21 * G), sample(26 * G), sample(21 * G), sample(22 * G)]));
+        // oscillation inside the window also counts as no progress
+        assert!(churn_detected(&[sample(20 * G), sample(20 * G), sample(20 * G)]));
+        // real progress: each cycle durably ahead of the last
+        assert!(!churn_detected(&[sample(20 * G), sample(25 * G), sample(30 * G)]));
+    }
+
+    #[test]
+    fn churn_body_names_the_problem_and_the_knob() {
+        let cfg = Config::default();
+        let body = churn_body(Duration::from_secs(4 * 3600), &cfg);
+        assert!(body.contains("suspended for 4h"), "{body}");
+        assert!(body.contains("unreachable"), "{body}");
+        assert!(body.contains("until_free_gib"), "{body}");
     }
 
     #[test]

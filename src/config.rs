@@ -73,7 +73,10 @@ fn default_max_items_per_cycle() -> usize {
     200
 }
 fn default_rate_limit_secs() -> u64 {
-    60
+    // One destructive cycle per minute turned a stuck disk into a
+    // delete/recreate machine gun (incident 2026-09). 5 min is still
+    // responsive and lets regeneration show up as churn, not progress.
+    300
 }
 fn default_notify() -> bool {
     true
@@ -156,9 +159,10 @@ pub struct Config {
     pub min_age_days_artifacts: u64,
     /// Minimum age (days) for an app cache (~/Library/Caches etc.).
     pub min_age_days_app_caches: u64,
-    /// Minimum age (days) when disk is tight (< low_watermark). Default: 1.
+    /// Minimum age (days) when disk is tight (< low_watermark). Fractional
+    /// days allowed (0.125 = 3h). Never effective below `MIN_AGE_FLOOR_DAYS`.
     #[serde(default = "default_min_age_days_tight")]
-    pub min_age_days_tight: u64,
+    pub min_age_days_tight: f64,
     /// Roots where build artifacts are hunted (allowlist — nothing outside is touched).
     pub artifact_roots: Vec<PathBuf>,
     /// Roots whose children are app caches (allowlist).
@@ -167,9 +171,21 @@ pub struct Config {
     pub artifact_names: Vec<String>,
 }
 
-fn default_min_age_days_tight() -> u64 {
-    0
+fn default_min_age_days_tight() -> f64 {
+    // 3h: low enough to react to a critical disk within hours, high enough
+    // that an in-flight build is never harvested (see MIN_AGE_FLOOR_DAYS).
+    0.125
 }
+
+/// Absolute floor for ANY minimum age — tight mode and `--older-than`
+/// included. Nothing younger than 1 hour is ever evicted automatically.
+/// Incident 2026-09: `min_age_days_tight = 0` let the daemon delete
+/// minutes-old `dist/`/`node_modules` while the builds that wrote them were
+/// still running; the agents rebuilt, the daemon re-deleted, and the FSEvents
+/// storm took fseventsd to 84 GiB RSS. A full disk is no excuse to harvest
+/// an in-flight build: when eviction can't help, the churn breaker reports
+/// "target unreachable" instead.
+pub const MIN_AGE_FLOOR_DAYS: f64 = 1.0 / 24.0;
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
@@ -216,7 +232,7 @@ impl Default for Config {
             watch_interval_secs: 300,
             min_age_days_artifacts: 1,
             min_age_days_app_caches: 14,
-            min_age_days_tight: 0,
+            min_age_days_tight: default_min_age_days_tight(),
             daemon: DaemonCfg::default(),
             tools: ToolsCfg::default(),
             artifact_roots: vec![software_root()],
@@ -227,11 +243,21 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn min_age_days_for(&self, class: crate::walk::Class, override_min: Option<u64>) -> u64 {
-        override_min.unwrap_or(match class {
-            crate::walk::Class::Artifact => self.min_age_days_artifacts,
-            crate::walk::Class::AppCache => self.min_age_days_app_caches,
-        })
+    /// Effective tight-mode minimum age (never below the hard floor).
+    pub fn tight_min_age(&self) -> f64 {
+        self.min_age_days_tight.max(MIN_AGE_FLOOR_DAYS)
+    }
+
+    /// Minimum age in days for a candidate of `class`. `override_min` (tight
+    /// mode / `--older-than`) replaces the class default but NOTHING goes
+    /// below `MIN_AGE_FLOOR_DAYS` — the "nothing-in-use" invariant is not
+    /// configurable away.
+    pub fn min_age_days_for(&self, class: crate::walk::Class, override_min: Option<f64>) -> f64 {
+        let min = override_min.unwrap_or(match class {
+            crate::walk::Class::Artifact => self.min_age_days_artifacts as f64,
+            crate::walk::Class::AppCache => self.min_age_days_app_caches as f64,
+        });
+        min.max(MIN_AGE_FLOOR_DAYS)
     }
 }
 
@@ -353,8 +379,42 @@ ollama = false
         assert!(!cfg.daemon.notify);
         assert_eq!(cfg.daemon.max_items_per_cycle, 200);
         assert_eq!(cfg.daemon.max_bytes_per_cycle_gib, 80.0);
-        assert_eq!(cfg.daemon.rate_limit_secs, 60);
+        assert_eq!(cfg.daemon.rate_limit_secs, 300);
         assert!(!cfg.tools.ollama);
         assert_eq!(cfg.tools.rustup_keep, 3);
+    }
+
+    /// The incident config (2026-09) had `min_age_days_tight = 0` as a TOML
+    /// *integer*. It must keep parsing into the f64 field.
+    #[test]
+    fn integer_tight_min_age_parses_as_float() {
+        let raw = r#"
+version = 1
+ledger = "/tmp/l.jsonl"
+until_free_gib = 100.0
+low_watermark_gib = 40.0
+watch_interval_secs = 300
+min_age_days_artifacts = 1
+min_age_days_app_caches = 14
+min_age_days_tight = 0
+artifact_roots = ["/tmp/software"]
+app_cache_roots = ["/tmp/Caches"]
+artifact_names = ["node_modules"]
+"#;
+        let cfg: Config = toml::from_str(raw).expect("integer 0 parses into f64");
+        assert_eq!(cfg.min_age_days_tight, 0.0);
+    }
+
+    /// No config value — not tight mode, not `--older-than` — buys the right
+    /// to evict something younger than `MIN_AGE_FLOOR_DAYS`.
+    #[test]
+    fn min_age_floor_is_not_configurable_away() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.min_age_days_for(crate::walk::Class::Artifact, None), 1.0);
+        assert_eq!(cfg.min_age_days_for(crate::walk::Class::Artifact, Some(0.0)), MIN_AGE_FLOOR_DAYS);
+        assert_eq!(cfg.min_age_days_for(crate::walk::Class::AppCache, Some(0.0)), MIN_AGE_FLOOR_DAYS);
+        cfg.min_age_days_tight = 0.0;
+        assert_eq!(cfg.tight_min_age(), MIN_AGE_FLOOR_DAYS);
+        assert_eq!(MIN_AGE_FLOOR_DAYS, 1.0 / 24.0, "floor is one hour");
     }
 }
