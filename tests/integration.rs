@@ -449,6 +449,55 @@ fn daemon_churn_guard_refuses_to_reevict_what_regenerated() {
 }
 
 #[test]
+fn daemon_churn_guard_bypassed_on_critical_disk_emergency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    daemon_tree(&root);
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            rate_limit_secs: 0,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let rep1 = vassoura::daemon::run_cycle(&cfg);
+    assert_eq!(rep1.removed, 4, "first cycle takes everything eligible");
+
+    // velho1's node_modules is regenerated
+    mkfile(&root.join("velho1/package.json"), 20);
+    mkfile(&root.join("velho1/pnpm-lock.yaml"), 20);
+    mkfile(&root.join("velho1/node_modules/dep/a.js"), 1000);
+    for p in [&root.join("velho1/node_modules/dep/a.js"), &root.join("velho1/node_modules/dep"), &root.join("velho1/node_modules"), &root.join("velho1"), &root] {
+        age_dir(p, 40);
+    }
+
+    // Normal cycle: churn guard rejects it
+    let gib = 1024u64 * 1024 * 1024;
+    let normal_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 30 * gib };
+    let rep2 = vassoura::daemon::run_cycle_sampling(&cfg, normal_disk);
+    assert_eq!(rep2.removed, 0, "normal cycle respects churn guard");
+    assert!(root.join("velho1/node_modules").exists());
+
+    // Emergency forced cycle (>= 95% full / forced): Invariant 5 emergency rule bypasses churn guard
+    let emergency_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 4 * gib }; // 98% used
+    let rep3 = vassoura::daemon::run_cycle_sampling_opts(
+        &cfg,
+        emergency_disk,
+        true, // forced emergency cycle
+        vassoura::daemon::ScanMode::Full,
+    );
+    assert_eq!(rep3.removed, 1, "emergency forced cycle bypasses churn guard to save host from ENOSPC");
+    assert!(!root.join("velho1/node_modules").exists());
+}
+
+#[test]
 fn daemon_churn_breaker_suspends_eviction_when_free_space_goes_nowhere() {
     // Flat free space across destructive cycles = regeneration churn. After
     // the window, the breaker must hold evictions — even with a fresh

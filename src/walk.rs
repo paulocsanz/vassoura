@@ -445,6 +445,22 @@ fn split_root(dir: &Path, names: &HashSet<&str>, prune: &HashSet<&str>) -> Vec<S
                 jobs.extend(sub);
             }
         } else {
+            // Check for immediate shallow artifacts in this repository/project directory
+            // (e.g. pedradb/target, centro/target, etc.) and promote them to Measure jobs
+            // so they are prioritized ahead of deep recursive Hunt scans.
+            if let Ok(sub_rd) = fs::read_dir(entry.path()) {
+                for sub_entry in sub_rd.flatten() {
+                    let sub_name = sub_entry.file_name();
+                    let sub_name = sub_name.to_string_lossy();
+                    if names.contains(sub_name.as_ref()) {
+                        if let Ok(sft) = sub_entry.file_type() {
+                            if sft.is_dir() && !sft.is_symlink() {
+                                jobs.push(ScanJob::Measure { path: sub_entry.path(), class: Class::Artifact });
+                            }
+                        }
+                    }
+                }
+            }
             jobs.push(ScanJob::Hunt(entry.path()));
         }
     }

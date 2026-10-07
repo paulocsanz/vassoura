@@ -30,7 +30,7 @@ pub fn build(
     cfg: &Config,
     override_min: Option<f64>,
 ) -> (Vec<PlanItem>, Vec<Rejected>) {
-    build_inner(cands, cfg, override_min, None)
+    build_inner(cands, cfg, override_min, None, false)
 }
 
 /// The daemon path: `build` with LRU by last-seen (seen.db, P2.1) and the
@@ -45,7 +45,21 @@ pub fn build_seen(
     override_min: Option<f64>,
     seen: &SeenDb,
 ) -> (Vec<PlanItem>, Vec<Rejected>) {
-    build_inner(cands, cfg, override_min, Some(seen))
+    build_inner(cands, cfg, override_min, Some(seen), false)
+}
+
+/// Emergency daemon path (Invariant 5 emergency rule): on critical disk
+/// usage (>= 95% / forced cycle), OS survival takes absolute priority over
+/// churn guard: the daemon evicts eligible candidates rather than allowing
+/// the disk to reach 0 bytes (ENOSPC).
+pub fn build_seen_emergency(
+    cands: Vec<Candidate>,
+    cfg: &Config,
+    override_min: Option<f64>,
+    seen: &SeenDb,
+    emergency: bool,
+) -> (Vec<PlanItem>, Vec<Rejected>) {
+    build_inner(cands, cfg, override_min, Some(seen), emergency)
 }
 
 /// A path evicted this recently is regeneration, not garbage.
@@ -56,6 +70,7 @@ fn build_inner(
     cfg: &Config,
     override_min: Option<f64>,
     seen: Option<&SeenDb>,
+    emergency: bool,
 ) -> (Vec<PlanItem>, Vec<Rejected>) {
     let now = SystemTime::now();
     let mut items = Vec::new();
@@ -78,19 +93,21 @@ fn build_inner(
             continue;
         }
         if let Some(seen) = seen {
-            if let Some(removed_at) = seen.last_removed(&c) {
-                let since = age_days(now, removed_at);
-                if since < CHURN_GUARD_DAYS {
-                    rejected.push(Rejected {
-                        path: c.path.clone(),
-                        bytes: c.bytes,
-                        reason: format!(
-                            "churn guard: evicted {} ago (< {}d) — it regenerated; leave it",
-                            fmt_age_short(since),
-                            CHURN_GUARD_DAYS
-                        ),
-                    });
-                    continue;
+            if !emergency {
+                if let Some(removed_at) = seen.last_removed(&c) {
+                    let since = age_days(now, removed_at);
+                    if since < CHURN_GUARD_DAYS {
+                        rejected.push(Rejected {
+                            path: c.path.clone(),
+                            bytes: c.bytes,
+                            reason: format!(
+                                "churn guard: evicted {} ago (< {}d) — it regenerated; leave it",
+                                fmt_age_short(since),
+                                CHURN_GUARD_DAYS
+                            ),
+                        });
+                        continue;
+                    }
                 }
             }
         }

@@ -245,7 +245,7 @@ pub fn run_cycle_sampling_opts(
     let d = sample_disk();
     rep.free_before = d.free;
 
-    let is_emergency = force || d.used_percent() >= EMERGENCY_USED_PERCENT;
+    let is_emergency = force || d.used_percent() >= FAST_PROBE_USED_PERCENT;
     let low_now = (cfg.low_watermark_gib * GIB as f64) as u64;
     let deadline = if d.free < low_now || d.used_percent() >= 90.0 {
         Some(Duration::from_secs(45))
@@ -301,7 +301,7 @@ pub fn run_cycle_sampling_opts(
         None
     };
 
-    let (items, _rejected) = plan::build_seen(cands, cfg, min_override, &seen);
+    let (items, _rejected) = plan::build_seen_emergency(cands, cfg, min_override, &seen, force);
     rep.eligible_bytes = items.iter().map(|i| i.cand.bytes).sum();
 
     // status fs (P2.2): the same values as `status --json`
@@ -324,7 +324,7 @@ pub fn run_cycle_sampling_opts(
             rep.backoff = true;
         } else {
             if now_emergency && seen.in_backoff(now).is_some() {
-                // Emergency override: on critical disk (>= 95% full), OS survival
+                // Emergency override: on critical disk (>= 98% full), OS survival
                 // takes absolute priority over churn backoff.
                 seen.clear_backoff();
             }
