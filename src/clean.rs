@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::ledger::{self, Line};
 use crate::plan::PlanItem;
+use crate::walk::Class;
 
 #[derive(Debug, Default)]
 pub struct Outcome {
@@ -53,8 +54,21 @@ pub fn apply_with(
             out.skipped.push((path.clone(), "changed since the scan (kept)".into()));
             continue;
         }
-        match remove_dir_all_writable(path) {
+        // Worktrees are removed through git, never `rm`: without `--force`,
+        // git refuses dirty, locked or submodule-populated checkouts — the
+        // race between scan and removal fails closed on git's own verdict.
+        let removal = if it.cand.class == Class::Worktree {
+            crate::worktrees::remove_worktree(path)
+        } else {
+            remove_dir_all_writable(path).map_err(|e| e.to_string())
+        };
+        match removal {
             Ok(()) => {
+                let hint = if it.cand.class == Class::Worktree {
+                    crate::worktrees::hint_for_existing(path).unwrap_or_else(|| "git worktree add <path> <ref>".into())
+                } else {
+                    it.hint.clone()
+                };
                 let line = Line {
                     ts: jiff::Timestamp::now().as_second(),
                     iso: crate::fmt_util::now_iso(),
@@ -63,7 +77,7 @@ pub fn apply_with(
                     path: path.display().to_string(),
                     bytes: it.cand.bytes,
                     age_days: it.age_days,
-                    hint: it.hint.clone(),
+                    hint,
                 };
                 if let Err(e) = ledger::append(ledger_path, &line) {
                     // a removal without a ledger violates the "nothing-without-ledger" refusal:

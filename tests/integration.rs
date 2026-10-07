@@ -499,6 +499,63 @@ fn daemon_churn_breaker_suspends_eviction_when_free_space_goes_nowhere() {
     assert_eq!(ledger.lines().count(), 3, "no removal while in backoff");
 }
 
+#[test]
+fn daemon_emergency_forced_cycle_evicts_even_when_in_churn_backoff() {
+    // When the disk usage hits >= 95% (emergency), fast probe wakes the daemon.
+    // If the churn breaker was previously in backoff, the emergency cycle MUST
+    // NOT sit idle with rep.backoff = true while the OS is dying with ENOSPC:
+    // survival has absolute priority.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    daemon_tree(&root);
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 10,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    // Pre-seed seen.db with an active backoff pause (as if the breaker tripped earlier)
+    let mut seen = vassoura::seen::SeenDb::load(&cfg.seen_db);
+    seen.trip_backoff(
+        std::time::SystemTime::now(),
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(3600),
+    );
+    seen.persist(&cfg.seen_db).unwrap();
+    assert!(seen.in_backoff(std::time::SystemTime::now()).is_some(), "backoff is armed");
+
+    // The disk is at 98% usage: 200 GiB total, 4 GiB free (< 5% free)
+    let gib = 1024u64 * 1024 * 1024;
+    let emergency_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 4 * gib };
+
+    // Forced cycle (emergency wakeup from fast probe)
+    let rep = vassoura::daemon::run_cycle_sampling_opts(
+        &cfg,
+        emergency_disk,
+        true, // force = true (woken by fast probe >= 95%)
+        vassoura::daemon::ScanMode::Full,
+    );
+
+    // MUST NOT be held: must evict the eligible candidates
+    assert!(
+        !rep.backoff,
+        "emergency forced cycle must not be held by churn backoff on a 98% full disk!"
+    );
+    assert!(
+        rep.removed >= 1,
+        "emergency forced cycle must remove eligible items to avoid ENOSPC, got {}",
+        rep.removed
+    );
+}
+
 // ---------------------------------------------------------------- P2.1/P2.2
 // seen.db feeds the LRU; statusfs matches status --json (same construction).
 

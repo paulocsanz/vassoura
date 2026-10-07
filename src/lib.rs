@@ -13,3 +13,4 @@ pub mod seen;
 pub mod statusfs;
 pub mod tools;
 pub mod walk;
+pub mod worktrees;

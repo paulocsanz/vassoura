@@ -46,7 +46,11 @@ pub fn lsof_state(path: &Path) -> UseState {
 }
 
 /// Nearest git repo above the candidate (dir OR file — the worktree).
+/// If `path` itself is a worktree checkout (contains `.git`), `path` is the repo.
 pub fn nearest_repo(path: &Path) -> Option<PathBuf> {
+    if path.join(".git").exists() {
+        return Some(path.to_path_buf());
+    }
     path.ancestors()
         .skip(1)
         .find(|a| a.join(".git").exists())
@@ -75,13 +79,24 @@ pub(crate) fn is_artifact_path(path: &Path) -> bool {
     })
 }
 
+pub(crate) fn is_ignored_dirty_path(path: &Path) -> bool {
+    if is_artifact_path(path) {
+        return true;
+    }
+    use crate::config::PRUNE_DIRS;
+    path.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        PRUNE_DIRS.contains(&name.as_ref())
+    })
+}
+
 pub(crate) fn parse_git_dirty_files(repo: &Path, stdout: &[u8]) -> Vec<PathBuf> {
     let s = String::from_utf8_lossy(stdout);
     let mut dirty = Vec::new();
     for line in s.lines() {
         let Some(p_str) = parse_dirty_path(line) else { continue };
         let rel = Path::new(p_str);
-        if is_artifact_path(rel) {
+        if is_ignored_dirty_path(rel) {
             continue;
         }
         dirty.push(repo.join(rel));
@@ -93,13 +108,15 @@ pub(crate) fn is_project_dirty(repo: &Path, candidate_path: &Path, dirty_files: 
     if dirty_files.is_empty() {
         return false;
     }
-    let project = candidate_path.parent().unwrap_or(candidate_path);
+    let project = if candidate_path == repo {
+        repo
+    } else {
+        candidate_path.parent().unwrap_or(candidate_path)
+    };
     if project == repo {
         return true;
     }
-    dirty_files.iter().any(|df| {
-        df.starts_with(project) || df.parent() == Some(repo)
-    })
+    dirty_files.iter().any(|df| df.starts_with(project))
 }
 
 /// Real git: a candidate inside a worktree with uncommitted work → skipped.
@@ -388,5 +405,53 @@ mod tests {
         let session = prepare(&[&cand_a, &cand_b]);
         assert!(session.check(&cand_a).is_some(), "pkg_a target should be skipped because pkg_a is dirty");
         assert!(session.check(&cand_b).is_none(), "pkg_b target should be clean because pkg_b has no uncommitted work");
+
+        // Untracked file in the repo root (e.g. notes.txt or .cleanup-plan.md) must NOT
+        // block an independent subproject.
+        std::fs::write(repo.join("notes.txt"), b"scratchpad").unwrap();
+        let session2 = prepare(&[&cand_b]);
+        assert!(session2.check(&cand_b).is_none(), "pkg_b target stays clean even with untracked root notes");
+
+        // Scratch files in .claude or .pr-worktrees must NOT block clean subprojects.
+        let claude_scratch = repo.join(".claude/scratch/test.py");
+        std::fs::create_dir_all(claude_scratch.parent().unwrap()).unwrap();
+        std::fs::write(&claude_scratch, b"test").unwrap();
+        let session3 = prepare(&[&cand_b]);
+        assert!(session3.check(&cand_b).is_none(), "pkg_b target stays clean with files in PRUNE_DIRS");
+    }
+
+    #[test]
+    fn git_gate_worktree_candidate_checks_own_worktree_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("main_repo");
+        let wt = tmp.path().join("side_wt");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let git_repo = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git_repo(&["init", "-q"]);
+        git_repo(&["config", "user.email", "t@t"]);
+        git_repo(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("README.md"), b"hi").unwrap();
+        git_repo(&["add", "."]);
+        git_repo(&["commit", "-qm", "init"]);
+        git_repo(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        // Main repo has an untracked file, but worktree `wt` is clean
+        std::fs::write(repo.join("dirty_in_main.txt"), b"dirty").unwrap();
+
+        let session = prepare(&[&wt]);
+        assert!(session.check(&wt).is_none(), "clean worktree candidate is free even if main repo has untracked files");
+
+        // Now dirty work occurs inside the worktree
+        std::fs::write(wt.join("uncommitted_in_wt.txt"), b"dirty in wt").unwrap();
+        let session_dirty = prepare(&[&wt]);
+        assert!(session_dirty.check(&wt).is_some(), "dirty worktree candidate is in-use/skipped");
     }
 }

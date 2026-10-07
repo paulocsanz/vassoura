@@ -36,6 +36,7 @@ pub const PRUNE_DIRS: &[&str] = &[
     ".fonte",
     ".claude",
     ".pr-worktrees",
+    ".cursor-worktrees",
     "miniforge",
     "miniforge3",
     "miniconda",
@@ -159,6 +160,9 @@ pub struct Config {
     pub min_age_days_artifacts: u64,
     /// Minimum age (days) for an app cache (~/Library/Caches etc.).
     pub min_age_days_app_caches: u64,
+    /// Minimum age (days) for a git worktree checkout (see `worktree_repos`).
+    #[serde(default = "default_min_age_days_worktrees")]
+    pub min_age_days_worktrees: u64,
     /// Minimum age (days) when disk is tight (< low_watermark). Fractional
     /// days allowed (0.125 = 3h). Never effective below `MIN_AGE_FLOOR_DAYS`.
     #[serde(default = "default_min_age_days_tight")]
@@ -167,6 +171,12 @@ pub struct Config {
     pub artifact_roots: Vec<PathBuf>,
     /// Roots whose children are app caches (allowlist).
     pub app_cache_roots: Vec<PathBuf>,
+    /// Repos whose git worktrees are collectible (allowlist — empty means
+    /// no worktree is ever touched). A worktree is only evicted clean,
+    /// merged into its origin default branch, and older than
+    /// `min_age_days_worktrees`; removal goes through `git worktree remove`.
+    #[serde(default)]
+    pub worktree_repos: Vec<PathBuf>,
     /// Directory names treated as artifacts.
     pub artifact_names: Vec<String>,
 }
@@ -175,6 +185,12 @@ fn default_min_age_days_tight() -> f64 {
     // 3h: low enough to react to a critical disk within hours, high enough
     // that an in-flight build is never harvested (see MIN_AGE_FLOOR_DAYS).
     0.125
+}
+
+fn default_min_age_days_worktrees() -> u64 {
+    // A worktree checkout holds source, not just build output: two weeks of
+    // silence before touching it.
+    14
 }
 
 /// Absolute floor for ANY minimum age — tight mode and `--older-than`
@@ -232,11 +248,13 @@ impl Default for Config {
             watch_interval_secs: 300,
             min_age_days_artifacts: 1,
             min_age_days_app_caches: 14,
+            min_age_days_worktrees: default_min_age_days_worktrees(),
             min_age_days_tight: default_min_age_days_tight(),
             daemon: DaemonCfg::default(),
             tools: ToolsCfg::default(),
             artifact_roots: vec![software_root()],
             app_cache_roots: vec![home().join("Library").join("Caches"), home().join(".cache")],
+            worktree_repos: Vec::new(),
             artifact_names: DEFAULT_ARTIFACT_NAMES.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -256,6 +274,7 @@ impl Config {
         let min = override_min.unwrap_or(match class {
             crate::walk::Class::Artifact => self.min_age_days_artifacts as f64,
             crate::walk::Class::AppCache => self.min_age_days_app_caches as f64,
+            crate::walk::Class::Worktree => self.min_age_days_worktrees as f64,
         });
         min.max(MIN_AGE_FLOOR_DAYS)
     }
@@ -311,6 +330,11 @@ pub fn expanded_roots(cfg: &Config) -> Vec<(crate::walk::Class, PathBuf)> {
         cfg.app_cache_roots
             .iter()
             .map(|p| (crate::walk::Class::AppCache, expand(p))),
+    );
+    v.extend(
+        cfg.worktree_repos
+            .iter()
+            .map(|p| (crate::walk::Class::Worktree, expand(p))),
     );
     v
 }

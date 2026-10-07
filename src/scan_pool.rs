@@ -33,11 +33,11 @@ pub fn run(
     cfg: &Config,
     root_filter: Option<&Path>,
     deadline: Option<Duration>,
-) -> Result<Vec<Candidate>, String> {
+) -> Result<(Vec<Candidate>, ScanHealth), String> {
     let names: Vec<String> = cfg.artifact_names.clone();
     let mut jobs = walk::list_jobs(cfg, root_filter);
     if jobs.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), ScanHealth::default()));
     }
     // Critical cycles rotate the queue so a slow prefix cannot starve the rest
     // forever: the next cycle starts further along.
@@ -50,8 +50,8 @@ pub fn run(
         jobs.rotate_left(shift);
     }
     let make = || spawn_vassoura(exe, &names);
-    let found = supervise(&make, jobs, WORKERS, SILENCE, deadline);
-    Ok(walk::accept(cfg, found))
+    let (found, health) = supervise(&make, jobs, WORKERS, SILENCE, deadline);
+    Ok((walk::accept(cfg, found), health))
 }
 
 fn spawn_vassoura(exe: &Path, names: &[String]) -> Result<WorkerProc, String> {
@@ -103,26 +103,56 @@ fn spawn_cmd(mut cmd: Command, names: &[String]) -> Result<WorkerProc, String> {
 }
 
 /// Shared by the real binary and by tests (tests pass a fake worker command).
+/// How sick the parallel scan was this cycle. The daemon's scan-health
+/// breaker (2026-10-01 incident) reads this: under memory/IO collapse the
+/// system killed every worker, `run()` returned Ok with ZERO candidates and
+/// the daemon printed "0 candidates · IDLE" while the disk was on fire —
+/// without the ability to measure, it cleaned nothing and said nothing.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ScanHealth {
+    pub spawn_failures: usize,
+    pub worker_deaths: usize,
+    pub silence_kills: usize,
+    pub deadline_stopped: usize,
+    pub jobs_uncompleted: usize,
+    pub jobs_total: usize,
+    /// True when the pool never ran (no executable) and the caller got the
+    /// in-process fallback scan.
+    pub in_process_fallback: bool,
+}
+
+impl ScanHealth {
+    pub fn is_clean(&self) -> bool {
+        self.spawn_failures == 0
+            && self.worker_deaths == 0
+            && self.silence_kills == 0
+            && self.deadline_stopped == 0
+            && self.jobs_uncompleted == 0
+    }
+}
+
 fn supervise(
     make: &dyn Fn() -> Result<WorkerProc, String>,
     jobs: Vec<ScanJob>,
     workers: usize,
     silence: Duration,
     deadline: Option<Duration>,
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, ScanHealth) {
     let mut queue: VecDeque<ScanJob> = jobs.into();
+    let mut health = ScanHealth { jobs_total: queue.len(), ..ScanHealth::default() };
     let mut pool: Vec<WorkerProc> = Vec::new();
     for _ in 0..workers {
         match make() {
             Ok(w) => pool.push(w),
             Err(e) => {
                 eprintln!("# warning: scan worker: {e}");
+                health.spawn_failures += 1;
                 break;
             }
         }
     }
     if pool.is_empty() {
-        return Vec::new();
+        return (Vec::new(), health);
     }
     let mut found: HashMap<PathBuf, Candidate> = HashMap::new();
     let mut stop = false;
@@ -140,6 +170,7 @@ fn supervise(
                     silence.as_secs().max(1),
                     w.current.as_deref().unwrap_or("?")
                 );
+                health.silence_kills += 1;
                 kill_worker(w);
                 if let Ok(fresh) = make() {
                     *w = fresh;
@@ -151,6 +182,7 @@ fn supervise(
                 if let Some(job) = queue.pop_front() {
                     if send_job(w, &job).is_err() {
                         eprintln!("# scan worker died before starting {}", job_label(&job));
+                        health.worker_deaths += 1;
                         kill_worker(w);
                         match make() {
                             Ok(fresh) => {
@@ -172,6 +204,7 @@ fn supervise(
             for w in &mut pool {
                 drain_worker(w, &mut found);
                 if !w.idle {
+                    health.deadline_stopped += 1;
                     eprintln!(
                         "# scan worker stopped (cycle deadline): {}",
                         w.current.as_deref().unwrap_or("?")
@@ -179,6 +212,7 @@ fn supervise(
                     kill_worker(w);
                 }
             }
+            health.jobs_uncompleted = queue.len();
             break;
         }
         if !live && queue.is_empty() {
@@ -192,7 +226,7 @@ fn supervise(
     for w in &mut pool {
         kill_worker(w);
     }
-    found.into_values().collect()
+    (found.into_values().collect(), health)
 }
 
 fn drain_worker(w: &mut WorkerProc, found: &mut HashMap<PathBuf, Candidate>) {
@@ -255,13 +289,17 @@ fn job_label(job: &ScanJob) -> String {
     }
 }
 
+fn class_from_label(v: &Value) -> Class {
+    match v.get("class").and_then(|c| c.as_str()) {
+        Some("app-cache") => Class::AppCache,
+        Some("worktree") => Class::Worktree,
+        _ => Class::Artifact,
+    }
+}
+
 fn cand_from_json(v: &Value) -> Option<Candidate> {
     let path = PathBuf::from(v.get("path")?.as_str()?);
-    let class = if v.get("class").and_then(|c| c.as_str()) == Some("app-cache") {
-        Class::AppCache
-    } else {
-        Class::Artifact
-    };
+    let class = class_from_label(v);
     let newest = ns_to_time(v.get("newest_ns").and_then(|n| n.as_u64()).unwrap_or(0));
     let root = ns_to_time(v.get("root_ns").and_then(|n| n.as_u64()).unwrap_or(0));
     Some(Candidate {
@@ -303,17 +341,21 @@ pub fn worker_main() {
     let prune_set: std::collections::HashSet<&str> = prune.iter().map(|s| s.as_str()).collect();
     let mut prog = walk::Progress::new(true);
     let mut last_beat = Instant::now() - Duration::from_secs(10);
-    let mut beat = || {
+    let mut beat = |cand: Option<&Candidate>| {
         if last_beat.elapsed() >= Duration::from_millis(500) {
-            println!("{}", json!({"op":"h"}));
-            let _ = std::io::stdout().flush();
+            if let Some(c) = cand {
+                emit_cand("partial", c);
+            } else {
+                println!("{}", json!({"op":"h"}));
+                let _ = std::io::stdout().flush();
+            }
             last_beat = Instant::now();
         }
     };
     for line in lines {
         let Ok(line) = line else { break };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        beat();
+        beat(None);
         match msg.get("op").and_then(|o| o.as_str()) {
             Some("hunt") => {
                 let Some(path) = msg.get("path").and_then(|p| p.as_str()) else { continue };
@@ -324,12 +366,12 @@ pub fn worker_main() {
             }
             Some("measure") => {
                 let Some(path) = msg.get("path").and_then(|p| p.as_str()) else { continue };
-                let class = if msg.get("class").and_then(|c| c.as_str()) == Some("app-cache") {
-                    Class::AppCache
-                } else {
-                    Class::Artifact
-                };
-                let c = walk::measure_budgeted(Path::new(path), class, &mut prog, &mut beat);
+                let class = class_from_label(&msg);
+                let p = Path::new(path);
+                let mut c = walk::measure_budgeted(p, class, &mut prog, &mut |pc| beat(Some(pc)));
+                if class == Class::Worktree {
+                    c.contains_git = false;
+                }
                 emit_cand("cand", &c);
             }
             _ => {}
@@ -396,16 +438,19 @@ for line in sys.stdin:
             ScanJob::Hunt(PathBuf::from("/tmp/ok-project")),
         ];
         let start = Instant::now();
-        let found = supervise(
+        let (found, health) = supervise(
             &python_worker,
             jobs,
             1,
-            Duration::from_millis(500),
+            Duration::from_millis(1500),
             None,
         );
-        assert!(start.elapsed() < Duration::from_secs(4), "hung job pinned the scan");
+        assert!(start.elapsed() < Duration::from_secs(6), "hung job pinned the scan");
         let paths: Vec<_> = found.iter().map(|c| c.path.display().to_string()).collect();
         assert!(paths.iter().any(|p| p.contains("ok-project")), "{paths:?}");
         assert!(!paths.iter().any(|p| p.contains("HANG")), "{paths:?}");
+        assert_eq!(health.silence_kills, 1, "the hang was a silence kill");
+        assert_eq!(health.worker_deaths, 0);
+        assert_eq!(health.jobs_total, 2);
     }
 }

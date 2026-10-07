@@ -320,13 +320,27 @@ fn cmd_clean(
 const PROBE_INTERVAL_SECS: u64 = 30;
 
 fn cmd_daemon(cfg: &config::Config, once: bool) -> Result<ExitCode, String> {
-    let mut force_next = disk_of(cfg).used_percent() >= 95.0;
+    let mut force_next = disk_of(cfg).used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
+    let mut scan_state = daemon::ScanHealthState::default();
     loop {
-        let rep = if force_next {
+        let mode = if scan_state.probe_mode { daemon::ScanMode::Probe } else { daemon::ScanMode::Full };
+        let rep = if mode == daemon::ScanMode::Probe {
+            daemon::run_cycle_probe(cfg)
+        } else if force_next {
             daemon::run_cycle_forced(cfg)
         } else {
             daemon::run_cycle(cfg)
         };
+        // scan-health breaker: a full scan that measured nothing degrades the
+        // next cycles to the shallow probe; probe retries full with backoff.
+        let mut verdict = daemon::next_scan_mode(scan_state, &rep.health, rep.scanned);
+        scan_state = verdict.state;
+        if let Some(msg) = verdict.degraded_msg.take() {
+            eprintln!("# {msg}");
+            if cfg.daemon.notify {
+                daemon::notify("vassoura — scan degraded", &msg, None);
+            }
+        }
         print_cycle(cfg, &rep);
         if once {
             return Ok(ExitCode::SUCCESS);
@@ -348,11 +362,12 @@ fn wait_between_cycles(cfg: &config::Config, _last_rep: &daemon::CycleReport) ->
         }
 
         let d = disk_of(cfg);
-        if d.used_percent() >= 95.0 {
+        if d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT {
             println!(
-                "  → fast probe: {} free ({:.1}% used >= 95%) · waking daemon to act immediately",
+                "  → fast probe: {} free ({:.1}% used >= {:.0}%) · waking daemon to act immediately",
                 human(d.free),
-                d.used_percent()
+                d.used_percent(),
+                daemon::FAST_PROBE_USED_PERCENT
             );
             let _ = std::io::stdout().flush();
             return true;
@@ -369,12 +384,13 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
         }
     };
     println!(
-        "cycle: {} candidates · eligible {} · free {} → {} · {}{}{}",
+        "cycle: {} candidates · eligible {} · free {} → {} · {}{}{}{}",
         rep.scanned,
         human(rep.eligible_bytes),
         human(rep.free_before),
         human(rep.free_after),
         action,
+        if rep.degraded { " [DEGRADED: shallow probe scan]" } else { "" },
         if rep.rate_limited { " [rate-limited: holding this cycle]" } else { "" },
         if rep.backoff { " [BACKOFF: churn breaker holding evictions]" } else { "" }
     );

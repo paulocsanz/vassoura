@@ -33,18 +33,117 @@ pub enum CycleAction {
 // took fseventsd to 84 GiB RSS and the machine thrashed. The breaker makes
 // "evicting is not working" a first-class conclusion instead of a loop.
 
+// ---------------------------------------------------------------- scan-health breaker
+// Incident 2026-10-01: the machine entered IO collapse (disk 97%, swap full,
+// agents building in parallel). The system killed every scan worker; `run()`
+// returned Ok with ZERO candidates and the daemon printed
+// "0 candidates · IDLE" while the disk burned — without the ability to
+// measure it cleaned nothing and said nothing, and the in-process fallback
+// wedged in the kernel for hours. The breaker makes "cannot measure" a
+// first-class state: degrade to the shallow PROBE scan (seconds instead of
+// an hour), say so loudly, and retry the full scan with backoff.
+
+/// Consecutive catastrophic scans before degrading to probe mode.
+pub const SCAN_DEATHS_TO_DEGRADE: u32 = 1;
+/// Probe-mode cycles before the first full-scan retry; doubles each further
+/// failure, capped (300s cadence → up to ~80 min between attempts).
+pub const SCAN_RETRY_BASE_CYCLES: u32 = 2;
+pub const SCAN_RETRY_CAP_CYCLES: u32 = 16;
+
+/// Which scan the next cycle should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    Full,
+    Probe,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ScanHealthState {
+    pub probe_mode: bool,
+    /// Consecutive catastrophic full scans (zero candidates + dead workers).
+    pub deaths_streak: u32,
+    /// Cycles spent in probe mode since the last full-scan attempt.
+    pub probe_cycles: u32,
+}
+
+pub struct ScanVerdict {
+    pub state: ScanHealthState,
+    pub mode: ScanMode,
+    /// Set on the transition into probe mode: the daemon notifies (this is
+    /// the "it says so" part — silence was the 2026-10-01 failure).
+    pub degraded_msg: Option<String>,
+}
+
+/// Pure transition: given the breaker state and this cycle's scan health,
+/// decide the next cycle's scan mode.
+pub fn next_scan_mode(
+    state: ScanHealthState,
+    health: &crate::scan_pool::ScanHealth,
+    scanned: usize,
+) -> ScanVerdict {
+    let mut state = state;
+    let catastrophic = scanned == 0
+        && (health.worker_deaths + health.silence_kills + health.spawn_failures > 0
+            || health.in_process_fallback);
+
+    if !state.probe_mode {
+        if catastrophic {
+            state.deaths_streak += 1;
+            if state.deaths_streak >= SCAN_DEATHS_TO_DEGRADE {
+                state.probe_mode = true;
+                state.probe_cycles = 0;
+                return ScanVerdict {
+                    state,
+                    mode: ScanMode::Probe,
+                    degraded_msg: Some(format!(
+                        "scan workers died ({} this cycle) — shallow probe mode until IO pressure drops",
+                        health.worker_deaths + health.silence_kills + health.spawn_failures
+                    )),
+                };
+            }
+        } else {
+            state.deaths_streak = 0;
+        }
+        return ScanVerdict { state, mode: ScanMode::Full, degraded_msg: None };
+    }
+
+    // probe mode: full scan is retried with exponential cycle backoff
+    state.probe_cycles += 1;
+    let retry_after = SCAN_RETRY_BASE_CYCLES
+        .saturating_pow(state.deaths_streak.min(4))
+        .min(SCAN_RETRY_CAP_CYCLES);
+    if state.probe_cycles >= retry_after {
+        state.probe_cycles = 0;
+        state.probe_mode = false;
+        ScanVerdict { state, mode: ScanMode::Full, degraded_msg: None }
+    } else {
+        ScanVerdict { state, mode: ScanMode::Probe, degraded_msg: None }
+    }
+}
+
 /// Consecutive destructive cycles the breaker looks at.
 pub const CHURN_WINDOW: usize = 3;
 /// Net free-space gain below which the window counts as "no progress".
 pub const CHURN_MIN_PROGRESS_BYTES: u64 = GIB;
+/// Minimum plunge in free space across the churn window that indicates an external
+/// write flood rather than regeneration churn.
+pub const CHURN_EXTERNAL_WRITE_FLOOD_BYTES: u64 = 5 * GIB;
 /// First backoff pause when the breaker trips; doubles on each consecutive
 /// trip, capped at `CHURN_BACKOFF_CAP`.
 pub const CHURN_BACKOFF_BASE: Duration = Duration::from_secs(60 * 60);
 pub const CHURN_BACKOFF_CAP: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Disk usage percentage where fast probe wakes the daemon (95%).
+pub const FAST_PROBE_USED_PERCENT: f64 = 95.0;
+/// Extreme emergency disk usage percentage where OS survival takes absolute priority (98%).
+pub const EMERGENCY_USED_PERCENT: f64 = 98.0;
+
 /// Trip when the last `CHURN_WINDOW` destructive cycles bought less than
 /// `CHURN_MIN_PROGRESS_BYTES` of durable free space: what the daemon deletes
-/// is coming back between cycles. Regeneration churn, not progress.
+/// is coming back between cycles.
+///
+/// A steep plunge caused by external writes (first - last is large) is a write
+/// flood, NOT regeneration churn — evictions must not be suspended while disk is falling.
 pub fn churn_detected(history: &[crate::seen::EvictionSample]) -> bool {
     if history.len() < CHURN_WINDOW {
         return false;
@@ -52,6 +151,13 @@ pub fn churn_detected(history: &[crate::seen::EvictionSample]) -> bool {
     let tail = &history[history.len() - CHURN_WINDOW..];
     let first = tail[0].free_after;
     let last = tail[tail.len() - 1].free_after;
+
+    // If free space plunged significantly across the window, external processes
+    // are writing heavily. This is an external write flood, not regeneration churn.
+    if first.saturating_sub(last) >= CHURN_EXTERNAL_WRITE_FLOOD_BYTES {
+        return false;
+    }
+
     last.saturating_sub(first) < CHURN_MIN_PROGRESS_BYTES
 }
 
@@ -91,6 +197,12 @@ pub struct CycleReport {
     pub removed: usize,
     pub freed: u64,
     pub skipped: Vec<(std::path::PathBuf, String)>,
+    /// Scan ran in shallow probe mode (scan-health breaker active).
+    pub degraded: bool,
+    /// Set on the transition into degraded mode: the caller notifies.
+    pub notify_msg: Option<String>,
+    /// What the scan pool reported about its own health this cycle.
+    pub health: crate::scan_pool::ScanHealth,
 }
 
 /// One daemon cycle: scan → seen.db → **re-stat** → statusfs → decision →
@@ -101,39 +213,70 @@ pub struct CycleReport {
 /// deciding from the stat at the start leaves the cycle IDLE with the disk
 /// already below the mark (measured: 45.9 → 20.8 GiB, 110 GiB eligible, IDLE).
 pub fn run_cycle(cfg: &Config) -> CycleReport {
-    run_cycle_sampling_opts(cfg, || disk_of(cfg), false)
+    run_cycle_sampling_opts(cfg, || disk_of(cfg), false, ScanMode::Full)
 }
 
-/// Run cycle with forced eviction (skips the rate-limit, e.g. when woken
-/// by fast probe on critical disk usage >= 95%). The churn backoff is
-/// NEVER skipped: a forced cycle that would only feed the regeneration
-/// loop is held like any other.
+/// Shallow-probe cycle: seconds of IO instead of a full walk. Used by the
+/// scan-health breaker while the machine cannot survive a full scan.
+pub fn run_cycle_probe(cfg: &Config) -> CycleReport {
+    run_cycle_sampling_opts(cfg, || disk_of(cfg), false, ScanMode::Probe)
+}
+
+/// Run cycle with forced eviction (skips the rate-limit and churn backoff,
+/// e.g. when woken by fast probe on critical disk usage >= 95%).
+/// On critical disk, OS survival takes absolute priority over churn backoff.
 pub fn run_cycle_forced(cfg: &Config) -> CycleReport {
-    run_cycle_sampling_opts(cfg, || disk_of(cfg), true)
+    run_cycle_sampling_opts(cfg, || disk_of(cfg), true, ScanMode::Full)
 }
 
 /// `run_cycle` with an injectable disk sampler (tests: free space drops
 /// between the start of the scan and the decision).
 pub fn run_cycle_sampling(cfg: &Config, sample_disk: impl FnMut() -> crate::disk::Disk) -> CycleReport {
-    run_cycle_sampling_opts(cfg, sample_disk, false)
+    run_cycle_sampling_opts(cfg, sample_disk, false, ScanMode::Full)
 }
 
 pub fn run_cycle_sampling_opts(
     cfg: &Config,
     mut sample_disk: impl FnMut() -> crate::disk::Disk,
     force: bool,
+    mode: ScanMode,
 ) -> CycleReport {
     let mut rep = CycleReport::default();
     let d = sample_disk();
     rep.free_before = d.free;
 
+    let is_emergency = force || d.used_percent() >= EMERGENCY_USED_PERCENT;
     let low_now = (cfg.low_watermark_gib * GIB as f64) as u64;
     let deadline = if d.free < low_now || d.used_percent() >= 90.0 {
         Some(Duration::from_secs(45))
     } else {
         Some(Duration::from_secs(120))
     };
-    let cands = walk::scan_with(cfg, None, true, deadline);
+    let cands = match mode {
+        ScanMode::Probe => {
+            rep.degraded = true;
+            walk::scan_probe(cfg, None)
+        }
+        ScanMode::Full => {
+            let (mut c, health) = walk::scan_with_health(cfg, None, true, deadline);
+            // a full scan that lost its workers measured nothing: degraded
+            // even in full mode, so the report never lies about coverage
+            let lost = health.worker_deaths + health.silence_kills + health.spawn_failures + health.deadline_stopped;
+            let truncated = health.jobs_uncompleted > 0 || health.deadline_stopped > 0;
+            if (c.is_empty() && (lost > 0 || health.in_process_fallback)) || truncated {
+                rep.degraded = true;
+            }
+            if is_emergency || truncated {
+                for pc in walk::scan_probe(cfg, None) {
+                    if !c.iter().any(|existing| existing.path == pc.path) {
+                        c.push(pc);
+                    }
+                }
+            }
+            rep.health = health;
+            c
+        }
+    };
     rep.scanned = cands.len();
 
     // seen.db (P2.1): LRU by last-seen, persisted every cycle
@@ -173,12 +316,18 @@ pub fn run_cycle_sampling_opts(
     rep.action = Some(action.clone());
     let now = SystemTime::now();
     let mut free_after_sampled = false;
+    let now_emergency = force || d_now.used_percent() >= EMERGENCY_USED_PERCENT;
     if let CycleAction::Evict { need_bytes, cap_bytes, cap_items } = action {
-        if seen.in_backoff(now).is_some() {
+        if seen.in_backoff(now).is_some() && !now_emergency {
             // Churn breaker: recent destructive cycles bought no durable free
             // space — deleting more only feeds the regeneration loop.
             rep.backoff = true;
         } else {
+            if now_emergency && seen.in_backoff(now).is_some() {
+                // Emergency override: on critical disk (>= 95% full), OS survival
+                // takes absolute priority over churn backoff.
+                seen.clear_backoff();
+            }
             let rl = Duration::from_secs(cfg.daemon.rate_limit_secs);
             if !force && rate_limited(seen.last_eviction, now, rl) {
                 rep.rate_limited = true;
@@ -379,6 +528,13 @@ mod tests {
     }
 
     #[test]
+    fn churn_breaker_does_not_trip_on_external_write_flood() {
+        // External process is writing tens of GiB: free space is falling (40G -> 14G -> 12G).
+        // This is an external write flood, NOT regeneration churn. The breaker must NOT trip!
+        assert!(!churn_detected(&[sample(40 * G), sample(14 * G), sample(12 * G)]));
+    }
+
+    #[test]
     fn churn_body_names_the_problem_and_the_knob() {
         let cfg = Config::default();
         let body = churn_body(Duration::from_secs(4 * 3600), &cfg);
@@ -404,5 +560,77 @@ mod tests {
     #[test]
     fn quote_os_escapes() {
         assert_eq!(quote_os("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    fn dead_health(n: usize) -> crate::scan_pool::ScanHealth {
+        crate::scan_pool::ScanHealth { worker_deaths: n, ..Default::default() }
+    }
+
+    #[test]
+    fn scan_breaker_degrades_after_catastrophic_scan_and_notifies() {
+        let v = next_scan_mode(ScanHealthState::default(), &dead_health(4), 0);
+        assert!(v.state.probe_mode, "zero candidates + dead workers → probe");
+        assert_eq!(v.mode, ScanMode::Probe);
+        let msg = v.degraded_msg.expect("transition says so");
+        assert!(msg.contains("probe"), "{msg}");
+    }
+
+    #[test]
+    fn scan_breaker_stays_full_when_workers_survived() {
+        let v = next_scan_mode(ScanHealthState::default(), &dead_health(1), 52);
+        assert!(!v.state.probe_mode, "candidates were collected: not catastrophic");
+        assert_eq!(v.mode, ScanMode::Full);
+        assert!(v.degraded_msg.is_none());
+        // clean cycle resets the streak
+        let after_bad = ScanHealthState { deaths_streak: 1, ..Default::default() };
+        let v2 = next_scan_mode(after_bad, &crate::scan_pool::ScanHealth::default(), 52);
+        assert_eq!(v2.state.deaths_streak, 0);
+        assert_eq!(v2.mode, ScanMode::Full);
+    }
+
+    #[test]
+    fn probe_mode_retries_full_with_backoff() {
+        let degraded = ScanHealthState { probe_mode: true, deaths_streak: 1, probe_cycles: 0 };
+        // retry_after = 2^deaths_streak = 2: ONE probe cycle, then a full retry
+        let v1 = next_scan_mode(degraded.clone(), &crate::scan_pool::ScanHealth::default(), 3);
+        assert_eq!(v1.mode, ScanMode::Probe);
+        assert_eq!(v1.state.probe_cycles, 1);
+        let v2 = next_scan_mode(v1.state.clone(), &crate::scan_pool::ScanHealth::default(), 3);
+        assert_eq!(v2.mode, ScanMode::Full, "backoff window (2) elapsed → full retry");
+        assert_eq!(v2.state.probe_cycles, 0);
+        assert!(!v2.state.probe_mode, "probe flag cleared on full retry");
+    }
+
+    #[test]
+    fn repeated_failures_escalate_the_backoff() {
+        let mut state = ScanHealthState::default();
+        // first failure → probe (streak 1 → retry every 2)
+        state = next_scan_mode(state, &dead_health(3), 0).state;
+        assert!(state.probe_mode);
+        // one probe cycle holds…
+        state = next_scan_mode(state, &Default::default(), 3).state;
+        assert_eq!(state.probe_cycles, 1);
+        // …then the full retry fires
+        let retry = next_scan_mode(state, &Default::default(), 3);
+        assert_eq!(retry.mode, ScanMode::Full);
+        assert!(!retry.state.probe_mode);
+        // …and fails catastrophically again → probe, streak 2 → retry every 4
+        let v = next_scan_mode(retry.state, &dead_health(3), 0);
+        assert_eq!(v.mode, ScanMode::Probe);
+        assert_eq!(v.state.deaths_streak, 2);
+        // with retry_after=4 the next THREE probe cycles hold, the 4th retries
+        let mut s = v.state;
+        let mut verdict = next_scan_mode(s, &Default::default(), 3);
+        s = verdict.state;
+        verdict = next_scan_mode(s, &Default::default(), 3);
+        s = verdict.state;
+        assert_eq!(verdict.mode, ScanMode::Probe, "backoff escalated: 2 → 4");
+        verdict = next_scan_mode(s, &Default::default(), 3);
+        s = verdict.state;
+        assert_eq!(verdict.mode, ScanMode::Probe, "still holding at cycle 3 of 4");
+        verdict = next_scan_mode(s, &Default::default(), 3);
+        s = verdict.state;
+        assert_eq!(verdict.mode, ScanMode::Full, "4th probe cycle retries full");
+        assert!(!s.probe_mode, "probe flag cleared on full retry");
     }
 }
