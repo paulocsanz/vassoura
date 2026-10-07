@@ -90,6 +90,24 @@ pub(crate) fn is_ignored_dirty_path(path: &Path) -> bool {
     })
 }
 
+fn untracked_dir_has_user_files(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if is_ignored_dirty_path(&p) {
+            continue;
+        }
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            if untracked_dir_has_user_files(&p) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn parse_git_dirty_files(repo: &Path, stdout: &[u8]) -> Vec<PathBuf> {
     let s = String::from_utf8_lossy(stdout);
     let mut dirty = Vec::new();
@@ -99,7 +117,11 @@ pub(crate) fn parse_git_dirty_files(repo: &Path, stdout: &[u8]) -> Vec<PathBuf> 
         if is_ignored_dirty_path(rel) {
             continue;
         }
-        dirty.push(repo.join(rel));
+        let full = repo.join(rel);
+        if line.starts_with("??") && full.is_dir() && !untracked_dir_has_user_files(&full) {
+            continue;
+        }
+        dirty.push(full);
     }
     dirty
 }
@@ -128,7 +150,7 @@ pub fn git_state(path: &Path) -> UseState {
     let out = Command::new("git")
         .arg("-C")
         .arg(&repo)
-        .args(["status", "--porcelain", "-uall"])
+        .args(["status", "--porcelain", "-unormal"])
         .output()
         .map_err(|e| format!("spawn git: {e}"));
     match out {
@@ -166,26 +188,29 @@ pub fn in_use(path: &Path) -> Option<String> {
 pub struct GateSession {
     git: std::collections::HashMap<PathBuf, Result<Vec<PathBuf>, String>>,
     open_paths: Vec<PathBuf>,
-    lsof_ok: bool,
+    lsof_err: Option<String>,
 }
 
 pub fn prepare(paths: &[&Path]) -> GateSession {
     use std::collections::HashSet;
     let repos: HashSet<PathBuf> = paths.iter().filter_map(|p| nearest_repo(p)).collect();
     let git = git_many(repos);
-    let (lsof_ok, open_paths) = lsof_snapshot();
-    GateSession { git, open_paths, lsof_ok }
+    let (open_paths, lsof_err) = match lsof_snapshot() {
+        Ok(paths) => (paths, None),
+        Err(e) => match lsof_batch_cwd_timeout(paths) {
+            Ok(batch_paths) => (batch_paths, None),
+            Err(batch_err) => (Vec::new(), Some(format!("{e}; batch probe: {batch_err}"))),
+        },
+    };
+    GateSession { git, open_paths, lsof_err }
 }
 
 impl GateSession {
     pub fn check(&self, path: &Path) -> Option<String> {
-        if !self.lsof_ok {
-            match lsof_cwd_timeout(path) {
-                Ok(true) => return Some("in use: process has the directory open (lsof cwd/fd)".into()),
-                Ok(false) => {}
-                Err(e) => return Some(format!("in use unavailable (fail-closed): {e}")),
-            }
-        } else if open_under(&self.open_paths, path) {
+        if let Some(err) = &self.lsof_err {
+            return Some(format!("in use unavailable (fail-closed): {err}"));
+        }
+        if open_under(&self.open_paths, path) {
             return Some("in use: process has a file open (lsof)".into());
         }
         if let Some(repo) = nearest_repo(path) {
@@ -208,8 +233,8 @@ impl GateSession {
 fn git_many(repos: std::collections::HashSet<PathBuf>) -> std::collections::HashMap<PathBuf, Result<Vec<PathBuf>, String>> {
     let repos: Vec<PathBuf> = repos.into_iter().collect();
     let mut slots = vec![Ok(Vec::new()); repos.len()];
-    // Bound concurrency to 4 threads to prevent I/O thrashing on large repos
-    for (chunk_repos, chunk_slots) in repos.chunks(4).zip(slots.chunks_mut(4)) {
+    // Bound concurrency to 2 threads to prevent I/O thrashing on large repos
+    for (chunk_repos, chunk_slots) in repos.chunks(2).zip(slots.chunks_mut(2)) {
         std::thread::scope(|scope| {
             for (repo, slot) in chunk_repos.iter().zip(chunk_slots.iter_mut()) {
                 scope.spawn(|| {
@@ -223,22 +248,19 @@ fn git_many(repos: std::collections::HashSet<PathBuf>) -> std::collections::Hash
 
 fn git_dirty_files_timeout(repo: &Path) -> Result<Vec<PathBuf>, String> {
     let out = crate::procutil::output_with_timeout(
-        Command::new("git").arg("-C").arg(repo).args(["status", "--porcelain", "-uall"]),
-        std::time::Duration::from_secs(60),
+        Command::new("git").arg("-C").arg(repo).args(["status", "--porcelain", "-unormal"]),
+        std::time::Duration::from_secs(90),
     )?;
     Ok(parse_git_dirty_files(repo, &out.stdout))
 }
 
 /// One `lsof` for every open file. Killed if it does not finish: the cycle
-/// then falls back to a per-directory cwd check, still with a timeout.
-fn lsof_snapshot() -> (bool, Vec<PathBuf>) {
+/// then falls back to a single batch check on the candidate paths.
+fn lsof_snapshot() -> Result<Vec<PathBuf>, String> {
     let out = crate::procutil::output_with_timeout(
-        Command::new("lsof").args(["-n", "-P", "-F", "n"]),
-        std::time::Duration::from_secs(30),
-    );
-    let Ok(out) = out else {
-        return (false, Vec::new());
-    };
+        Command::new("lsof").args(["-n", "-P", "-w", "-F", "n"]),
+        std::time::Duration::from_secs(45),
+    )?;
     let mut paths = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         // -F n lines are "n" + the path. Skip the field marker.
@@ -247,15 +269,29 @@ fn lsof_snapshot() -> (bool, Vec<PathBuf>) {
             paths.push(PathBuf::from(rest));
         }
     }
-    (true, paths)
+    Ok(paths)
 }
 
-fn lsof_cwd_timeout(path: &Path) -> Result<bool, String> {
-    let out = crate::procutil::output_with_timeout(
-        Command::new("lsof").args(["-w", "-F", "p", "--"]).arg(path),
-        std::time::Duration::from_secs(3),
-    )?;
-    Ok(!out.stdout.is_empty())
+fn lsof_batch_cwd_timeout(paths: &[&Path]) -> Result<Vec<PathBuf>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut opens = Vec::new();
+    for chunk in paths.chunks(100) {
+        let mut cmd = Command::new("lsof");
+        cmd.args(["-n", "-P", "-w", "-F", "pn", "--"]);
+        for p in chunk {
+            cmd.arg(p);
+        }
+        let out = crate::procutil::output_with_timeout(&mut cmd, std::time::Duration::from_secs(15))?;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(rest) = line.strip_prefix('n') else { continue };
+            if rest.starts_with('/') {
+                opens.push(PathBuf::from(rest));
+            }
+        }
+    }
+    Ok(opens)
 }
 
 fn open_under(opens: &[PathBuf], dir: &Path) -> bool {

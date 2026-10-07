@@ -39,15 +39,20 @@ pub fn run(
     if jobs.is_empty() {
         return Ok((Vec::new(), ScanHealth::default()));
     }
-    // Critical cycles rotate the queue so a slow prefix cannot starve the rest
+    // Critical cycles rotate deep hunt jobs so a slow prefix cannot starve the rest
     // forever: the next cycle starts further along.
+    // Fast Measure jobs (caches, /tmp targets, worktrees) ALWAYS stay at the front.
     if deadline.is_some() {
-        let shift = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as usize)
-            .unwrap_or(0)
-            % jobs.len();
-        jobs.rotate_left(shift);
+        let first_hunt = jobs.iter().position(|j| matches!(j, ScanJob::Hunt(_))).unwrap_or(jobs.len());
+        let hunt_count = jobs.len() - first_hunt;
+        if hunt_count > 1 {
+            let shift = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as usize)
+                .unwrap_or(0)
+                % hunt_count;
+            jobs[first_hunt..].rotate_left(shift);
+        }
     }
     let make = || spawn_vassoura(exe, &names);
     let (found, health) = supervise(&make, jobs, WORKERS, SILENCE, deadline);

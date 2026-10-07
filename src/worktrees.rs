@@ -150,6 +150,55 @@ pub fn merged_into_origin(repo: &Path, head: &str, origin_ref: &str) -> Result<b
     Ok(out.status.success())
 }
 
+/// Check multiple worktree HEADs against the origin default branch in a single
+/// git invocation via `git rev-list --no-walk <heads...> --not <origin_ref>`.
+/// Returns a set of HEAD hashes that ARE merged into origin.
+/// Falls back to individual `merged_into_origin` if the batch command fails.
+pub fn filter_merged_heads<'a>(
+    repo: &Path,
+    heads: impl IntoIterator<Item = &'a str>,
+    origin_ref: &str,
+) -> Result<std::collections::HashSet<String>, String> {
+    use std::collections::HashSet;
+    let heads: Vec<&'a str> = heads.into_iter().collect();
+    if heads.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(repo).args(["rev-list", "--no-walk"]);
+    for h in &heads {
+        cmd.arg(*h);
+    }
+    cmd.args(["--not", origin_ref]);
+
+    let out = crate::procutil::output_with_timeout(&mut cmd, std::time::Duration::from_secs(15));
+    match out {
+        Ok(o) if o.status.success() => {
+            let unmerged: HashSet<String> = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect();
+            let mut merged = HashSet::new();
+            for h in heads {
+                if !unmerged.contains(h) {
+                    merged.insert(h.to_string());
+                }
+            }
+            Ok(merged)
+        }
+        _ => {
+            // Fallback: test individually
+            let mut merged = HashSet::new();
+            for h in heads {
+                if merged_into_origin(repo, h, origin_ref).unwrap_or(false) {
+                    merged.insert(h.to_string());
+                }
+            }
+            Ok(merged)
+        }
+    }
+}
+
 /// Structural eligibility: merged into origin (fail-closed) and not already
 /// registered as removed. The age/in-use/churn gates are the generic ones
 /// (plan.rs + gates.rs); the final dirty/locked check is git itself at

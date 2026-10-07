@@ -229,18 +229,34 @@ fn scan_inprocess(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<
             None => true,
         };
         let origin_ref = crate::worktrees::origin_default(&repo);
-        for wt in crate::worktrees::enumerate(&repo) {
-            if !in_scope(&wt.path) {
-                continue;
+        if let Some(oref) = origin_ref {
+            let mut candidate_wts = Vec::new();
+            let now = SystemTime::now();
+            let one_hour = std::time::Duration::from_secs(3600);
+            for wt in crate::worktrees::enumerate(&repo) {
+                if !in_scope(&wt.path) {
+                    continue;
+                }
+                if let Ok(md) = fs::symlink_metadata(&wt.path) {
+                    if let Ok(mtime) = md.modified() {
+                        if now.duration_since(mtime).unwrap_or_default() < one_hour {
+                            continue;
+                        }
+                    }
+                }
+                candidate_wts.push(wt);
             }
-            let eligible = match &origin_ref {
-                Some(oref) => crate::worktrees::merged_into_origin(&repo, &wt.head, oref).unwrap_or(false),
-                None => false,
-            };
-            if !eligible {
-                continue;
+            let merged_heads = crate::worktrees::filter_merged_heads(
+                &repo,
+                candidate_wts.iter().map(|w| w.head.as_str()),
+                &oref,
+            ).unwrap_or_default();
+
+            for wt in candidate_wts {
+                if merged_heads.contains(&wt.head) {
+                    out.push(crate::worktrees::measure_worktree(&wt.path, &mut prog));
+                }
             }
-            out.push(crate::worktrees::measure_worktree(&wt.path, &mut prog));
         }
     }
 
@@ -354,18 +370,36 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
             None => true,
         };
         let origin_ref = crate::worktrees::origin_default(&repo);
-        for wt in crate::worktrees::enumerate(&repo) {
-            if !in_scope(&wt.path) {
-                continue;
+        if let Some(oref) = origin_ref {
+            let mut candidate_wts = Vec::new();
+            let now = SystemTime::now();
+            let one_hour = std::time::Duration::from_secs(3600);
+            for wt in crate::worktrees::enumerate(&repo) {
+                if !in_scope(&wt.path) {
+                    continue;
+                }
+                // Invariant 4: minimum age floor is 1h. If the root was modified
+                // within the last hour, it is actively in use and cannot be evicted.
+                if let Ok(md) = fs::symlink_metadata(&wt.path) {
+                    if let Ok(mtime) = md.modified() {
+                        if now.duration_since(mtime).unwrap_or_default() < one_hour {
+                            continue;
+                        }
+                    }
+                }
+                candidate_wts.push(wt);
             }
-            let eligible = match &origin_ref {
-                Some(oref) => crate::worktrees::merged_into_origin(&repo, &wt.head, oref).unwrap_or(false),
-                None => false,
-            };
-            if !eligible {
-                continue;
+            let merged_heads = crate::worktrees::filter_merged_heads(
+                &repo,
+                candidate_wts.iter().map(|w| w.head.as_str()),
+                &oref,
+            ).unwrap_or_default();
+
+            for wt in candidate_wts {
+                if merged_heads.contains(&wt.head) {
+                    measure_jobs.push(ScanJob::Measure { path: wt.path, class: Class::Worktree });
+                }
             }
-            measure_jobs.push(ScanJob::Measure { path: wt.path, class: Class::Worktree });
         }
     }
 

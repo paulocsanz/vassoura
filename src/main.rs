@@ -168,8 +168,13 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
     let d = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
-    let tight_override = (d.free < low).then_some(cfg.min_age_days_tight);
-    let cands = walk::scan(cfg, None, false);
+    let is_tight = d.free < low;
+    let tight_override = is_tight.then_some(cfg.min_age_days_tight);
+    let cands = if is_tight {
+        walk::scan_with(cfg, None, false, Some(std::time::Duration::from_secs(30)))
+    } else {
+        walk::scan(cfg, None, false)
+    };
     let (items, rejected) = plan::build(cands, cfg, tight_override);
     let eligible: u64 = items.iter().map(|i| i.cand.bytes).sum();
     let report = statusfs::build_report(d, cfg, eligible, items.len());
@@ -232,7 +237,11 @@ fn cmd_clean(
         .map(|d| d as f64)
         .or_else(|| (d_init.free < low).then_some(cfg.min_age_days_tight));
     let until = until_free.unwrap_or(cfg.until_free_gib);
-    let cands = walk::scan(cfg, root, false);
+    let cands = if is_tight {
+        walk::scan_with(cfg, root, false, Some(std::time::Duration::from_secs(45)))
+    } else {
+        walk::scan(cfg, root, false)
+    };
     let (items, rejected) = plan::build(cands, cfg, effective_older_than);
     // Re-stat after the scan: the plan uses free space now. The walk is long
     // and the disk moves during it — the same bug as the daemon cycle.
