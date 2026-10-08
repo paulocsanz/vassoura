@@ -177,6 +177,13 @@ pub struct Config {
     /// `min_age_days_worktrees`; removal goes through `git worktree remove`.
     #[serde(default)]
     pub worktree_repos: Vec<PathBuf>,
+    /// Per-root minimum age in days (longest matching prefix wins). Temp
+    /// zones regenerate by the GB per hour — a 14-day cache age lets them
+    /// eat the disk before the daemon acts (2026-10-03: /private/tmp went
+    /// 1 → 73 GB in an afternoon). Overrides also shorten the churn guard
+    /// for those roots: temp regenerating is harmless by definition.
+    #[serde(default)]
+    pub age_overrides: std::collections::HashMap<String, u64>,
     /// Directory names treated as artifacts.
     pub artifact_names: Vec<String>,
 }
@@ -255,6 +262,7 @@ impl Default for Config {
             artifact_roots: vec![software_root()],
             app_cache_roots: vec![home().join("Library").join("Caches"), home().join(".cache")],
             worktree_repos: Vec::new(),
+            age_overrides: std::collections::HashMap::new(),
             artifact_names: DEFAULT_ARTIFACT_NAMES.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -277,6 +285,21 @@ impl Config {
             crate::walk::Class::Worktree => self.min_age_days_worktrees as f64,
         });
         min.max(MIN_AGE_FLOOR_DAYS)
+    }
+
+    /// Explicit per-root age override (longest matching expanded prefix).
+    pub fn age_override_for(&self, path: &Path) -> Option<f64> {
+        let mut best: Option<(usize, f64)> = None;
+        for (root, days) in &self.age_overrides {
+            let root = expand(Path::new(root));
+            if path.starts_with(&root) {
+                let len = root.as_os_str().len();
+                if best.map(|(l, _)| len > l).unwrap_or(true) {
+                    best = Some((len, *days as f64));
+                }
+            }
+        }
+        best.map(|(_, d)| d.max(MIN_AGE_FLOOR_DAYS))
     }
 }
 

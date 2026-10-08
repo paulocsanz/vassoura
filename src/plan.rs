@@ -92,18 +92,22 @@ fn build_inner(
             });
             continue;
         }
+        // an explicit per-root age override marks a temp zone: it regenerates
+        // by the GB per hour and re-deleting it harms nobody — 1 day of guard
+        let root_override = cfg.age_override_for(&c.path);
+        let churn_days = if root_override.is_some() { 1.0 } else { CHURN_GUARD_DAYS };
         if let Some(seen) = seen {
             if !emergency {
                 if let Some(removed_at) = seen.last_removed(&c) {
                     let since = age_days(now, removed_at);
-                    if since < CHURN_GUARD_DAYS {
+                    if since < churn_days {
                         rejected.push(Rejected {
                             path: c.path.clone(),
                             bytes: c.bytes,
                             reason: format!(
                                 "churn guard: evicted {} ago (< {}d) — it regenerated; leave it",
                                 fmt_age_short(since),
-                                CHURN_GUARD_DAYS
+                                churn_days
                             ),
                         });
                         continue;
@@ -111,7 +115,12 @@ fn build_inner(
                 }
             }
         }
-        let min = cfg.min_age_days_for(c.class, override_min);
+        // explicit root override lowers the class minimum (tight mode keeps
+        // winning when critical: the 1h absolute floor is in min_age_days_for)
+        let min = match root_override {
+            Some(o) => o.min(cfg.min_age_days_for(c.class, override_min)),
+            None => cfg.min_age_days_for(c.class, override_min),
+        };
         let age = age_days(now, c.newest_mtime);
         if age < min {
             rejected.push(Rejected {
@@ -372,5 +381,43 @@ mod tests {
         std::fs::write(rs.path().join("Cargo.toml"), "").unwrap();
         std::fs::create_dir_all(rs.path().join("target")).unwrap();
         assert_eq!(regen_hint(&rs.path().join("target")), "cargo build");
+    }
+
+    #[test]
+    fn age_override_lowers_min_age_and_churn_for_temp_roots() {
+        use crate::seen::SeenDb;
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("seen.db");
+        let cfg = Config {
+            age_overrides: [("/tmp/whale".to_string(), 1u64)].into_iter().collect(),
+            ..Config::default()
+        };
+        // longest prefix wins; the 1h absolute floor still applies
+        assert_eq!(cfg.age_override_for(Path::new("/tmp/whale/target")), Some(1.0));
+        assert_eq!(cfg.age_override_for(Path::new("/tmp/other")), None);
+        assert_eq!(
+            cfg.age_override_for(Path::new("/tmp/whale/fresh")),
+            Some(1.0)
+        );
+
+        // a 2-day-old candidate removed 2 days ago: without the override the
+        // 7d churn guard blocks it; with the 1d temp guard it is eligible
+        let mut seen = SeenDb::load(&db);
+        let c_old = cand("/tmp/whale/target", GIB, 2);
+        let c_plain = cand("/home/x/plain/target", GIB, 2);
+        seen.mark_removed(Path::new("/tmp/whale/target"), SystemTime::now() - Duration::from_secs(2 * 86400));
+        seen.mark_removed(Path::new("/home/x/plain/target"), SystemTime::now() - Duration::from_secs(2 * 86400));
+        let (items, rejected) = build_seen(
+            vec![c_old, c_plain],
+            &cfg,
+            None,
+            &seen,
+        );
+        assert!(items.iter().any(|i| i.cand.path == Path::new("/tmp/whale/target")),
+            "temp override: 2d guard < override → eligible; rejected: {rejected:?}");
+        assert!(rejected.iter().any(|r| r.path == Path::new("/home/x/plain/target")
+            && r.reason.contains("churn guard")),
+            "plain root keeps the 7d guard; {rejected:?}");
     }
 }
