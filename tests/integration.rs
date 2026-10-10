@@ -467,7 +467,9 @@ fn daemon_churn_guard_bypassed_on_critical_disk_emergency() {
         ..sandbox_cfg(root.clone(), home.clone())
     };
 
-    let rep1 = vassoura::daemon::run_cycle(&cfg);
+    let gib = 1024u64 * 1024 * 1024;
+    let normal_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 30 * gib };
+    let rep1 = vassoura::daemon::run_cycle_sampling(&cfg, normal_disk);
     assert_eq!(rep1.removed, 4, "first cycle takes everything eligible");
 
     // velho1's node_modules is regenerated
@@ -479,8 +481,6 @@ fn daemon_churn_guard_bypassed_on_critical_disk_emergency() {
     }
 
     // Normal cycle: churn guard rejects it
-    let gib = 1024u64 * 1024 * 1024;
-    let normal_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 30 * gib };
     let rep2 = vassoura::daemon::run_cycle_sampling(&cfg, normal_disk);
     assert_eq!(rep2.removed, 0, "normal cycle respects churn guard");
     assert!(root.join("velho1/node_modules").exists());

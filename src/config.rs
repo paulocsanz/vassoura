@@ -292,7 +292,7 @@ impl Config {
         let mut best: Option<(usize, f64)> = None;
         for (root, days) in &self.age_overrides {
             let root = expand(Path::new(root));
-            if path.starts_with(&root) {
+            if path.starts_with(&root) || crate::walk::path_matches_root(path, &root) {
                 let len = root.as_os_str().len();
                 if best.map(|(l, _)| len > l).unwrap_or(true) {
                     best = Some((len, *days as f64));

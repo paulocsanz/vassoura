@@ -36,6 +36,12 @@ Watermarked build-artifact collector (Rust CLI + daemon).
    the full scan with exponential cycle backoff. It never reports a false
    "0 candidates · IDLE" — an empty catalog under pressure is a degraded
    state, not a clean bill of health.
+7. **darwin-var-folders-leaf-isolation** (2026-10 incident): macOS `/var/folders` (and `/private/var/folders`)
+   has a multi-tier layout: `<bucket>/<user_hash>/[T,C,X,0]/<candidate>`.
+   Candidates are NEVER cataloged at bucket or user-hash level (root-owned,
+   multi-tenant, in perpetual use by daemons). Enumeration traverses to depth 4
+   so each discrete directory (Playwright artifacts, test dirs, browser caches)
+   is an independent candidate, preventing wedge/timeout on 90,000 files in one job.
 
 ## Working rules
 

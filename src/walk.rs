@@ -185,8 +185,8 @@ fn scan_inprocess(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<
             continue;
         }
         let scan_from = match root_filter.map(expand) {
-            Some(f) if root.starts_with(&f) => root.clone(),
-            Some(f) if f.starts_with(&root) => f,
+            Some(f) if path_matches_root(&root, &f) => root.clone(),
+            Some(f) if path_matches_root(&f, &root) => f,
             Some(_) => continue,
             None => root.clone(),
         };
@@ -199,23 +199,13 @@ fn scan_inprocess(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<
             continue;
         }
         let scan_from = match root_filter.map(expand) {
-            Some(f) if root.starts_with(&f) => root.clone(),
-            Some(f) if f.starts_with(&root) => f,
+            Some(f) if path_matches_root(&root, &f) => root.clone(),
+            Some(f) if path_matches_root(&f, &root) => f,
             Some(_) => continue,
             None => root.clone(),
         };
-        if let Ok(rd) = fs::read_dir(&scan_from) {
-            for entry in rd.flatten() {
-                if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
-                    let path = entry.path();
-                    let class = if is_artifact_candidate_dir(&path, &names) {
-                        Class::Artifact
-                    } else {
-                        Class::AppCache
-                    };
-                    out.push(measure(&path, class, &mut prog));
-                }
-            }
+        for (path, class) in enumerate_app_cache_candidates(&root, &scan_from, &names) {
+            out.push(measure(&path, class, &mut prog));
         }
     }
 
@@ -225,7 +215,7 @@ fn scan_inprocess(cfg: &Config, root_filter: Option<&Path>, quiet: bool) -> Vec<
             continue;
         }
         let in_scope = |wt: &Path| match root_filter.map(expand) {
-            Some(f) => wt.starts_with(&f) || f.starts_with(wt),
+            Some(f) => path_matches_root(wt, &f) || path_matches_root(&f, wt),
             None => true,
         };
         let origin_ref = crate::worktrees::origin_default(&repo);
@@ -286,6 +276,150 @@ pub(crate) fn is_artifact_candidate_dir(path: &Path, names: &HashSet<&str>) -> b
     false
 }
 
+/// Helper to identify if a path is part of a Darwin `var/folders` structure.
+///
+/// On macOS, `getconf DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR` point to:
+/// `/var/folders/<bucket>/<user_hash>/[T,C,X,0]/...`
+/// (or `/private/var/folders/<bucket>/<user_hash>/[T,C,X,0]/...`).
+///
+/// The buckets (e.g. `q_`, `zz`) and user hashes contain directories for multiple
+/// users and system daemons. Evicting at the bucket or hash level is impossible
+/// (root permissions) and catastrophic. Furthermore, macOS daemons write to `T` and `C`
+/// continuously, so the bucket directory is always 0 seconds old and in use.
+///
+/// The actual regenerable build dust and test artifacts (e.g. Playwright, cargo test,
+/// browser caches) sit as individual directories inside `T`, `C`, `X`, and `0` (depth 4
+/// from `var/folders`).
+pub(crate) fn is_var_folders_root(root: &Path) -> bool {
+    let s = root.to_string_lossy();
+    let s = s.trim_end_matches('/');
+    s == "/var/folders" || s == "/private/var/folders" || s.ends_with("/var/folders")
+}
+
+pub(crate) fn strip_private_prefix(p: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = p.strip_prefix("/private") {
+        Some(Path::new("/").join(rel))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn path_matches_root(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    if let Some(norm_path) = strip_private_prefix(path) {
+        if norm_path.starts_with(root) {
+            return true;
+        }
+    }
+    if let Some(norm_root) = strip_private_prefix(root) {
+        if path.starts_with(&norm_root) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Enumerate candidate directories inside an `app_cache_roots` entry.
+///
+/// For standard cache roots (e.g. `~/Library/Caches`, `/private/tmp`), this
+/// returns the immediate child directories.
+/// For Darwin `var/folders` roots, this traverses down to depth 4 (the child
+/// directories inside `T`, `C`, `X`, `0`) where discrete test and build artifacts
+/// reside.
+pub(crate) fn enumerate_app_cache_candidates(
+    root: &Path,
+    scan_from: &Path,
+    names: &HashSet<&str>,
+) -> Vec<(PathBuf, Class)> {
+    let mut candidates = Vec::new();
+
+    if is_var_folders_root(root) {
+        let rel_depth = if let Ok(rel) = scan_from.strip_prefix(root) {
+            rel.components().count()
+        } else if let Some(norm_scan) = strip_private_prefix(scan_from) {
+            if let Ok(rel) = norm_scan.strip_prefix(root) {
+                rel.components().count()
+            } else {
+                0
+            }
+        } else if let Some(norm_root) = strip_private_prefix(root) {
+            if let Ok(rel) = scan_from.strip_prefix(&norm_root) {
+                rel.components().count()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if rel_depth >= 4 {
+            if let Ok(meta) = fs::symlink_metadata(scan_from) {
+                if meta.is_dir() && !meta.is_symlink() {
+                    let class = if is_artifact_candidate_dir(scan_from, names) {
+                        Class::Artifact
+                    } else {
+                        Class::AppCache
+                    };
+                    candidates.push((scan_from.to_path_buf(), class));
+                }
+            }
+            return candidates;
+        }
+
+        let remaining_levels = 4 - rel_depth;
+        let mut current_dirs = vec![scan_from.to_path_buf()];
+
+        for _ in 1..remaining_levels {
+            let mut next_dirs = Vec::new();
+            for dir in current_dirs {
+                if let Ok(rd) = fs::read_dir(dir) {
+                    for entry in rd.flatten() {
+                        if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                            next_dirs.push(entry.path());
+                        }
+                    }
+                }
+            }
+            current_dirs = next_dirs;
+        }
+
+        for dir in current_dirs {
+            if let Ok(rd) = fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                        let path = entry.path();
+                        let class = if is_artifact_candidate_dir(&path, names) {
+                            Class::Artifact
+                        } else {
+                            Class::AppCache
+                        };
+                        candidates.push((path, class));
+                    }
+                }
+            }
+        }
+        return candidates;
+    }
+
+    if let Ok(rd) = fs::read_dir(scan_from) {
+        for entry in rd.flatten() {
+            if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                let path = entry.path();
+                let class = if is_artifact_candidate_dir(&path, names) {
+                    Class::Artifact
+                } else {
+                    Class::AppCache
+                };
+                candidates.push((path, class));
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Drop candidates outside the allowlist and duplicate paths.
 pub(crate) fn accept(cfg: &Config, mut out: Vec<Candidate>) -> Vec<Candidate> {
     let allowed = crate::config::expanded_roots(cfg);
@@ -295,7 +429,7 @@ pub(crate) fn accept(cfg: &Config, mut out: Vec<Candidate>) -> Vec<Candidate> {
             let class_match = c.class == Class::Worktree
                 || *class == c.class
                 || (*class == Class::AppCache && c.class == Class::Artifact);
-            class_match && c.path.starts_with(root)
+            class_match && path_matches_root(&c.path, root)
         }) && seen.insert(c.path.clone());
         ok
     });
@@ -323,8 +457,8 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
             continue;
         }
         let scan_from = match root_filter.map(expand) {
-            Some(f) if root.starts_with(&f) => root.clone(),
-            Some(f) if f.starts_with(&root) => f,
+            Some(f) if path_matches_root(&root, &f) => root.clone(),
+            Some(f) if path_matches_root(&f, &root) => f,
             Some(_) => continue,
             None => root.clone(),
         };
@@ -341,23 +475,13 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
             continue;
         }
         let scan_from = match root_filter.map(expand) {
-            Some(f) if root.starts_with(&f) => root.clone(),
-            Some(f) if f.starts_with(&root) => f,
+            Some(f) if path_matches_root(&root, &f) => root.clone(),
+            Some(f) if path_matches_root(&f, &root) => f,
             Some(_) => continue,
             None => root.clone(),
         };
-        if let Ok(rd) = fs::read_dir(&scan_from) {
-            for entry in rd.flatten() {
-                if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
-                    let path = entry.path();
-                    let class = if is_artifact_candidate_dir(&path, &names) {
-                        Class::Artifact
-                    } else {
-                        Class::AppCache
-                    };
-                    measure_jobs.push(ScanJob::Measure { path, class });
-                }
-            }
+        for (path, class) in enumerate_app_cache_candidates(&root, &scan_from, &names) {
+            measure_jobs.push(ScanJob::Measure { path, class });
         }
     }
     for repo in &cfg.worktree_repos {
@@ -366,7 +490,7 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
             continue;
         }
         let in_scope = |wt: &Path| match root_filter.map(expand) {
-            Some(f) => wt.starts_with(&f) || f.starts_with(wt),
+            Some(f) => path_matches_root(wt, &f) || path_matches_root(&f, wt),
             None => true,
         };
         let origin_ref = crate::worktrees::origin_default(&repo);
@@ -789,4 +913,79 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn darwin_var_folders_enumerates_leaf_candidates_not_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let var_folders = tmp.path().join("var/folders");
+        let bucket = var_folders.join("q_");
+        let user_hash = bucket.join("5tskc6890_z2pk73666wb_m40000gn");
+        let temp_dir = user_hash.join("T");
+        let cache_dir = user_hash.join("C");
+        let cand1 = temp_dir.join("playwright-artifacts-dead");
+        let cand2 = temp_dir.join("cargo-test-target");
+        let cand3 = cache_dir.join("com.google.Chrome");
+
+        std::fs::create_dir_all(&cand1).unwrap();
+        std::fs::create_dir_all(&cand2).unwrap();
+        std::fs::create_dir_all(&cand3).unwrap();
+        std::fs::write(cand1.join("trace.zip"), b"trace").unwrap();
+        std::fs::write(cand2.join("output"), b"build").unwrap();
+        std::fs::write(cand3.join("data"), b"cache").unwrap();
+
+        let cfg = Config {
+            artifact_roots: vec![],
+            app_cache_roots: vec![var_folders.clone()],
+            worktree_repos: vec![],
+            ..Config::default()
+        };
+
+        let jobs = list_jobs(&cfg, None);
+        let mut job_map = std::collections::HashMap::new();
+        for j in jobs {
+            match j {
+                ScanJob::Measure { path, class } => {
+                    job_map.insert(path, class);
+                }
+                ScanJob::Hunt(p) => panic!("unexpected Hunt job: {}", p.display()),
+            }
+        }
+
+        assert!(!job_map.contains_key(&bucket), "bucket directory q_ must not be candidate");
+        assert!(!job_map.contains_key(&user_hash), "user hash directory must not be candidate");
+        assert!(!job_map.contains_key(&temp_dir), "T directory must not be candidate");
+        assert!(!job_map.contains_key(&cache_dir), "C directory must not be candidate");
+
+        assert_eq!(job_map.get(&cand1), Some(&Class::AppCache));
+        assert_eq!(job_map.get(&cand2), Some(&Class::Artifact));
+        assert_eq!(job_map.get(&cand3), Some(&Class::AppCache));
+
+        // Scan in-process also finds the leaf candidates and measures bytes
+        let scanned = scan_inprocess(&cfg, None, true);
+        assert_eq!(scanned.len(), 3);
+        assert!(scanned.iter().all(|c| c.bytes > 0));
+
+        // Root filter down to T only returns T items
+        let filtered_jobs = list_jobs(&cfg, Some(&temp_dir));
+        assert_eq!(filtered_jobs.len(), 2);
+        let filtered_paths: Vec<_> = filtered_jobs.into_iter().map(|j| match j {
+            ScanJob::Measure { path, .. } => path,
+            ScanJob::Hunt(..) => unreachable!(),
+        }).collect();
+        assert!(filtered_paths.contains(&cand1));
+        assert!(filtered_paths.contains(&cand2));
+        assert!(!filtered_paths.contains(&cand3));
+    }
+
+    #[test]
+    fn path_matches_root_handles_darwin_private_symlink_aliases() {
+        assert!(path_matches_root(Path::new("/private/var/folders/q_/item"), Path::new("/var/folders")));
+        assert!(path_matches_root(Path::new("/var/folders/q_/item"), Path::new("/private/var/folders")));
+        assert!(path_matches_root(Path::new("/private/tmp/cargo-target"), Path::new("/tmp")));
+        assert!(path_matches_root(Path::new("/tmp/cargo-target"), Path::new("/private/tmp")));
+        assert!(path_matches_root(Path::new("/Users/paulo/software"), Path::new("/Users/paulo/software")));
+        assert!(!path_matches_root(Path::new("/etc/passwd"), Path::new("/tmp")));
+        assert!(!path_matches_root(Path::new("/var/folders"), Path::new("/tmp")));
+    }
 }
+
