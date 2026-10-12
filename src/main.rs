@@ -124,7 +124,7 @@ fn disk_of(cfg: &config::Config) -> disk::Disk {
 }
 
 fn cmd_scan(cfg: &config::Config, root: Option<&std::path::Path>, top: usize, json: bool) -> Result<ExitCode, String> {
-    let cands = walk::scan(cfg, root, false);
+    let cands = walk::scan_with(cfg, root, false, Some(std::time::Duration::from_secs(45)));
     if json {
         for c in &cands {
             let v = serde_json::json!({
@@ -290,6 +290,13 @@ fn cmd_clean(
     }
     for (reason, (n, b)) in &rej_counts {
         println!("outside the plan: {reason} — {n} dirs, {}", human(*b));
+    }
+    let mut top_rej = rejected.clone();
+    top_rej.sort_by_key(|r| std::cmp::Reverse(r.bytes));
+    for r in top_rej.iter().take(10) {
+        if r.bytes > 50 * 1024 * 1024 {
+            println!("  [outside] {:<10} {:<35} {}", human(r.bytes), r.reason, r.path.display());
+        }
     }
 
     if !apply {

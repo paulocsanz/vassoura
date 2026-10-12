@@ -23,6 +23,7 @@ struct WorkerProc {
     stdin: std::process::ChildStdin,
     rx: Receiver<String>,
     idle: bool,
+    dead: bool,
     last_msg: Instant,
     /// Job currently assigned, so a kill can name it in the log.
     current: Option<String>,
@@ -69,7 +70,7 @@ fn spawn_cmd(mut cmd: Command, names: &[String]) -> Result<WorkerProc, String> {
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn scan worker: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("worker stdin")?;
@@ -79,8 +80,31 @@ fn spawn_cmd(mut cmd: Command, names: &[String]) -> Result<WorkerProc, String> {
         "names": names,
         "prune": PRUNE_DIRS,
     });
-    writeln!(stdin, "{cfg_line}").map_err(|e| e.to_string())?;
-    stdin.flush().map_err(|e| e.to_string())?;
+    if let Err(e) = writeln!(stdin, "{cfg_line}").and_then(|_| stdin.flush()) {
+        let mut err_msg = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_string(&mut err_msg);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let detail = if err_msg.trim().is_empty() {
+            e.to_string()
+        } else {
+            format!("{e}: {}", err_msg.trim())
+        };
+        return Err(format!("write cfg to scan worker: {detail}"));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for l in reader.lines().map_while(Result::ok) {
+                if !l.trim().is_empty() {
+                    eprintln!("# scan worker stderr: {l}");
+                }
+            }
+        });
+    }
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -102,6 +126,7 @@ fn spawn_cmd(mut cmd: Command, names: &[String]) -> Result<WorkerProc, String> {
         stdin,
         rx,
         idle: true,
+        dead: false,
         last_msg: Instant::now(),
         current: None,
     })
@@ -168,8 +193,16 @@ fn supervise(
         }
         let mut live = false;
         for w in &mut pool {
-            drain_worker(w, &mut found);
-            if !w.idle && w.last_msg.elapsed() >= silence {
+            drain_worker(w, &mut found, &mut health);
+            if w.dead && !stop {
+                match make() {
+                    Ok(fresh) => *w = fresh,
+                    Err(e) => {
+                        eprintln!("# warning: scan worker respawn: {e}");
+                    }
+                }
+            }
+            if !w.dead && !w.idle && w.last_msg.elapsed() >= silence {
                 eprintln!(
                     "# scan worker killed (no progress for {}s): {}",
                     silence.as_secs().max(1),
@@ -177,13 +210,12 @@ fn supervise(
                 );
                 health.silence_kills += 1;
                 kill_worker(w);
-                if let Ok(fresh) = make() {
-                    *w = fresh;
-                } else {
-                    w.idle = true;
+                match make() {
+                    Ok(fresh) => *w = fresh,
+                    Err(e) => eprintln!("# warning: scan worker: {e}"),
                 }
             }
-            if w.idle && !stop {
+            if !w.dead && w.idle && !stop {
                 if let Some(job) = queue.pop_front() {
                     if send_job(w, &job).is_err() {
                         eprintln!("# scan worker died before starting {}", job_label(&job));
@@ -192,14 +224,17 @@ fn supervise(
                         match make() {
                             Ok(fresh) => {
                                 *w = fresh;
-                                queue.push_front(job);
+                                queue.push_back(job);
                             }
-                            Err(e) => eprintln!("# warning: scan worker: {e}"),
+                            Err(e) => {
+                                eprintln!("# warning: scan worker: {e}");
+                                queue.push_back(job);
+                            }
                         }
                     }
                 }
             }
-            if !w.idle {
+            if !w.dead && !w.idle {
                 live = true;
             }
         }
@@ -207,7 +242,7 @@ fn supervise(
             // Deadline: keep candidates already emitted and kill the rest
             // so eviction can run. The next cycle rotates the queue.
             for w in &mut pool {
-                drain_worker(w, &mut found);
+                drain_worker(w, &mut found, &mut health);
                 if !w.idle {
                     health.deadline_stopped += 1;
                     eprintln!(
@@ -220,10 +255,15 @@ fn supervise(
             health.jobs_uncompleted = queue.len();
             break;
         }
+        let any_alive = pool.iter().any(|w| !w.dead);
+        if !any_alive && !queue.is_empty() {
+            health.jobs_uncompleted = queue.len();
+            break;
+        }
         if !live && queue.is_empty() {
             break;
         }
-        if pool.iter().all(|w| w.idle) && queue.is_empty() {
+        if pool.iter().all(|w| w.idle || w.dead) && queue.is_empty() {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -234,7 +274,7 @@ fn supervise(
     (found.into_values().collect(), health)
 }
 
-fn drain_worker(w: &mut WorkerProc, found: &mut HashMap<PathBuf, Candidate>) {
+fn drain_worker(w: &mut WorkerProc, found: &mut HashMap<PathBuf, Candidate>, health: &mut ScanHealth) {
     while let Ok(line) = w.rx.try_recv() {
         w.last_msg = Instant::now();
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
@@ -254,13 +294,15 @@ fn drain_worker(w: &mut WorkerProc, found: &mut HashMap<PathBuf, Candidate>) {
     }
     if let Ok(Some(_)) = w.child.try_wait() {
         // Process left without a `done` line: abandon the job.
-        if !w.idle {
+        if !w.idle && !w.dead {
             eprintln!(
                 "# scan worker exited early: {}",
                 w.current.as_deref().unwrap_or("?")
             );
+            health.worker_deaths += 1;
         }
-        w.idle = true;
+        w.dead = true;
+        w.idle = false;
         w.current = None;
     }
 }
@@ -284,7 +326,8 @@ fn send_job(w: &mut WorkerProc, job: &ScanJob) -> std::io::Result<()> {
 fn kill_worker(w: &mut WorkerProc) {
     let _ = w.child.kill();
     let _ = w.child.wait();
-    w.idle = true;
+    w.dead = true;
+    w.idle = false;
     w.current = None;
 }
 
@@ -418,6 +461,8 @@ for line in sys.stdin:
     if op == "cfg":
         continue
     path = msg.get("path", "")
+    if "CRASH" in path:
+        sys.exit(42)
     if "HANG" in path:
         sys.stdout.write(json.dumps({"op":"h"}) + "\n")
         sys.stdout.flush()
@@ -457,5 +502,26 @@ for line in sys.stdin:
         assert_eq!(health.silence_kills, 1, "the hang was a silence kill");
         assert_eq!(health.worker_deaths, 0);
         assert_eq!(health.jobs_total, 2);
+    }
+
+    #[test]
+    fn an_early_crashing_worker_is_respawned_and_scan_survives() {
+        let jobs = vec![
+            ScanJob::Hunt(PathBuf::from("/tmp/CRASH")),
+            ScanJob::Hunt(PathBuf::from("/tmp/ok-project")),
+        ];
+        let start = Instant::now();
+        let (found, health) = supervise(
+            &python_worker,
+            jobs,
+            1,
+            Duration::from_millis(1500),
+            None,
+        );
+        assert!(start.elapsed() < Duration::from_secs(6), "crashing job pinned the scan");
+        let paths: Vec<_> = found.iter().map(|c| c.path.display().to_string()).collect();
+        assert!(paths.iter().any(|p| p.contains("ok-project")), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains("CRASH")), "{paths:?}");
+        assert!(health.worker_deaths >= 1, "worker death was recorded");
     }
 }
