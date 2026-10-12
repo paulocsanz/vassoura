@@ -168,13 +168,17 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
     let d = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
-    let is_tight = d.free < low;
-    let tight_override = is_tight.then_some(cfg.min_age_days_tight);
-    let cands = if is_tight {
-        walk::scan_with(cfg, None, false, Some(std::time::Duration::from_secs(30)))
+    let is_critical = d.free < low || d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
+    let is_tight = d.free < high || d.used_percent() >= 90.0;
+    let tight_override = is_critical.then_some(cfg.min_age_days_tight);
+    let deadline = if is_critical {
+        Some(std::time::Duration::from_secs(30))
+    } else if is_tight {
+        Some(std::time::Duration::from_secs(45))
     } else {
-        walk::scan(cfg, None, false)
+        Some(std::time::Duration::from_secs(90))
     };
+    let cands = walk::scan_with(cfg, None, false, deadline);
     let (items, rejected) = plan::build(cands, cfg, tight_override);
     let eligible: u64 = items.iter().map(|i| i.cand.bytes).sum();
     let report = statusfs::build_report(d, cfg, eligible, items.len());
@@ -232,23 +236,28 @@ fn cmd_clean(
 ) -> Result<ExitCode, String> {
     let d_init = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
-    let is_tight = older_than.is_none() && d_init.free < low;
+    let high = (cfg.until_free_gib * GIB as f64) as u64;
+    let is_critical = d_init.free < low || d_init.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
+    let is_tight = d_init.free < high || d_init.used_percent() >= 90.0;
     let effective_older_than = older_than
         .map(|d| d as f64)
-        .or_else(|| (d_init.free < low).then_some(cfg.min_age_days_tight));
+        .or_else(|| is_critical.then_some(cfg.min_age_days_tight));
     let until = until_free.unwrap_or(cfg.until_free_gib);
-    let cands = if is_tight {
-        walk::scan_with(cfg, root, false, Some(std::time::Duration::from_secs(45)))
+    let deadline = if is_critical {
+        Some(std::time::Duration::from_secs(30))
+    } else if is_tight {
+        Some(std::time::Duration::from_secs(45))
     } else {
-        walk::scan(cfg, root, false)
+        Some(std::time::Duration::from_secs(90))
     };
+    let cands = walk::scan_with(cfg, root, false, deadline);
     let (items, rejected) = plan::build(cands, cfg, effective_older_than);
     // Re-stat after the scan: the plan uses free space now. The walk is long
     // and the disk moves during it — the same bug as the daemon cycle.
     let d = disk_of(cfg);
     let packed = plan::pack(items, d.free, until, top);
 
-    if is_tight {
+    if is_critical && older_than.is_none() {
         println!(
             "# tight mode active (< {:.0} GiB watermark): using min age {} (hard floor {})",
             cfg.low_watermark_gib,
@@ -329,7 +338,9 @@ fn cmd_clean(
 const PROBE_INTERVAL_SECS: u64 = 30;
 
 fn cmd_daemon(cfg: &config::Config, once: bool) -> Result<ExitCode, String> {
-    let mut force_next = disk_of(cfg).used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
+    let d_init = disk_of(cfg);
+    let low = (cfg.low_watermark_gib * GIB as f64) as u64;
+    let mut force_next = d_init.free < low || d_init.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
     let mut scan_state = daemon::ScanHealthState::default();
     loop {
         let mode = if scan_state.probe_mode { daemon::ScanMode::Probe } else { daemon::ScanMode::Full };
@@ -371,12 +382,14 @@ fn wait_between_cycles(cfg: &config::Config, _last_rep: &daemon::CycleReport) ->
         }
 
         let d = disk_of(cfg);
-        if d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT {
+        let low = (cfg.low_watermark_gib * GIB as f64) as u64;
+        if d.free < low || d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT {
             println!(
-                "  → fast probe: {} free ({:.1}% used >= {:.0}%) · waking daemon to act immediately",
+                "  → fast probe: {} free ({:.1}% used >= {:.0}% or below low {} GiB) · waking daemon to act immediately",
                 human(d.free),
                 d.used_percent(),
-                daemon::FAST_PROBE_USED_PERCENT
+                daemon::FAST_PROBE_USED_PERCENT,
+                cfg.low_watermark_gib
             );
             let _ = std::io::stdout().flush();
             return true;

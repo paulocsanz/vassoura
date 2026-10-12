@@ -295,13 +295,15 @@ pub fn run_cycle_sampling_opts(
         seen.clear_backoff();
     }
 
-    let min_override = if d_now.free < low {
+    let now_emergency = force || d_now.used_percent() >= EMERGENCY_USED_PERCENT;
+
+    let min_override = if d_now.free < low || now_emergency {
         Some(cfg.min_age_days_tight)
     } else {
         None
     };
 
-    let (items, _rejected) = plan::build_seen_emergency(cands, cfg, min_override, &seen, force);
+    let (items, _rejected) = plan::build_seen_emergency(cands, cfg, min_override, &seen, now_emergency);
     rep.eligible_bytes = items.iter().map(|i| i.cand.bytes).sum();
 
     // status fs (P2.2): the same values as `status --json`
@@ -316,7 +318,6 @@ pub fn run_cycle_sampling_opts(
     rep.action = Some(action.clone());
     let now = SystemTime::now();
     let mut free_after_sampled = false;
-    let now_emergency = force || d_now.used_percent() >= EMERGENCY_USED_PERCENT;
     if let CycleAction::Evict { need_bytes, cap_bytes, cap_items } = action {
         if seen.in_backoff(now).is_some() && !now_emergency {
             // Churn breaker: recent destructive cycles bought no durable free
@@ -329,7 +330,7 @@ pub fn run_cycle_sampling_opts(
                 seen.clear_backoff();
             }
             let rl = Duration::from_secs(cfg.daemon.rate_limit_secs);
-            if !force && rate_limited(seen.last_eviction, now, rl) {
+            if !now_emergency && rate_limited(seen.last_eviction, now, rl) {
                 rep.rate_limited = true;
             } else if need_bytes > 0 {
                 let candidate_paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
