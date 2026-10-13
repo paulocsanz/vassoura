@@ -7,6 +7,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::walk::{Candidate, Class};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UseState {
     /// Nothing in use: the candidate stays eligible.
@@ -207,11 +209,28 @@ pub fn prepare(paths: &[&Path]) -> GateSession {
 
 impl GateSession {
     pub fn check(&self, path: &Path) -> Option<String> {
+        self.check_candidate_policy(path, Class::Artifact, false)
+    }
+
+    pub fn check_candidate(&self, cand: &Candidate, emergency: bool) -> Option<String> {
+        self.check_candidate_policy(&cand.path, cand.class, emergency)
+    }
+
+    pub fn check_candidate_policy(&self, path: &Path, class: Class, emergency: bool) -> Option<String> {
         if let Some(err) = &self.lsof_err {
             return Some(format!("in use unavailable (fail-closed): {err}"));
         }
         if open_under(&self.open_paths, path) {
             return Some("in use: process has a file open (lsof)".into());
+        }
+        // In an emergency (disk >= 95% full or free space below low watermark), OS survival
+        // takes priority over incremental build caches: pure regenerable artifacts
+        // (target, node_modules, .venv, etc.) and app caches whose files are not held open
+        // by any process can be evicted even if the containing repo has uncommitted edits.
+        // Class::Worktree checkouts NEVER bypass this: a dirty worktree checkout contains
+        // uncommitted user source code and must never be deleted!
+        if emergency && class != Class::Worktree {
+            return None;
         }
         if let Some(repo) = nearest_repo(path) {
             if let Some(res) = self.git.get(&repo) {
@@ -489,5 +508,64 @@ mod tests {
         std::fs::write(wt.join("uncommitted_in_wt.txt"), b"dirty in wt").unwrap();
         let session_dirty = prepare(&[&wt]);
         assert!(session_dirty.check(&wt).is_some(), "dirty worktree candidate is in-use/skipped");
+    }
+
+    #[test]
+    fn git_gate_emergency_bypasses_dirty_repo_for_artifacts_but_protects_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let target = repo.join("target");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("Cargo.toml"), b"[package]").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        // Uncommitted changes in repo and worktree
+        std::fs::write(repo.join("src.rs"), b"// dirty").unwrap();
+        std::fs::write(wt.join("wt.rs"), b"// dirty wt").unwrap();
+
+        let art_cand = Candidate {
+            path: target.clone(),
+            class: Class::Artifact,
+            bytes: 1024,
+            newest_mtime: std::time::SystemTime::now(),
+            root_mtime: std::time::SystemTime::now(),
+            contains_git: false,
+            entries: 10,
+        };
+        let wt_cand = Candidate {
+            path: wt.clone(),
+            class: Class::Worktree,
+            bytes: 2048,
+            newest_mtime: std::time::SystemTime::now(),
+            root_mtime: std::time::SystemTime::now(),
+            contains_git: false,
+            entries: 5,
+        };
+
+        let session = prepare(&[&target, &wt]);
+
+        // In normal non-emergency, both are skipped due to uncommitted work
+        assert!(session.check_candidate(&art_cand, false).is_some(), "artifact skipped in normal mode when repo is dirty");
+        assert!(session.check_candidate(&wt_cand, false).is_some(), "worktree skipped in normal mode when wt is dirty");
+
+        // In emergency mode, artifact is ALLOWED (bypass dirty repo), but worktree is STILL REFUSED!
+        assert!(session.check_candidate(&art_cand, true).is_none(), "artifact allowed in emergency even if repo is dirty");
+        assert!(session.check_candidate(&wt_cand, true).is_some(), "worktree NEVER removed in emergency if dirty");
     }
 }

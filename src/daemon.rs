@@ -161,17 +161,39 @@ pub fn churn_detected(history: &[crate::seen::EvictionSample]) -> bool {
     last.saturating_sub(first) < CHURN_MIN_PROGRESS_BYTES
 }
 
-/// Pure hysteresis decision for the cycle.
-pub fn decide_cycle(free: u64, low_bytes: u64, high_bytes: u64, cap_bytes: u64, cap_items: usize) -> CycleAction {
-    if free >= low_bytes {
-        return CycleAction::Idle;
+/// Pure hysteresis decision for the cycle:
+/// - In idle state: evictions trigger when free < low_bytes.
+/// - In evicting state: evictions continue until free >= high_bytes.
+pub fn decide_cycle(
+    is_evicting: &mut bool,
+    free: u64,
+    low_bytes: u64,
+    high_bytes: u64,
+    cap_bytes: u64,
+    cap_items: usize,
+) -> CycleAction {
+    if *is_evicting {
+        if free >= high_bytes {
+            *is_evicting = false;
+            return CycleAction::Idle;
+        }
+        let need = high_bytes.saturating_sub(free);
+        if need == 0 {
+            *is_evicting = false;
+            return CycleAction::Idle;
+        }
+        CycleAction::Evict { need_bytes: need, cap_bytes, cap_items }
+    } else {
+        if free >= low_bytes {
+            return CycleAction::Idle;
+        }
+        let need = high_bytes.saturating_sub(free);
+        if need == 0 {
+            return CycleAction::Idle;
+        }
+        *is_evicting = true;
+        CycleAction::Evict { need_bytes: need, cap_bytes, cap_items }
     }
-    let need = high_bytes.saturating_sub(free);
-    if need == 0 {
-        // inverted marks or already at the high target: nothing to do
-        return CycleAction::Idle;
-    }
-    CycleAction::Evict { need_bytes: need, cap_bytes, cap_items }
 }
 
 /// Rate-limit: an eviction less than `rate_limit` ago → hold this cycle.
@@ -314,7 +336,14 @@ pub fn run_cycle_sampling_opts(
     }
 
     let cap_bytes = (cfg.daemon.max_bytes_per_cycle_gib * GIB as f64) as u64;
-    let action = decide_cycle(d_now.free, low, high, cap_bytes, cfg.daemon.max_items_per_cycle);
+    let action = decide_cycle(
+        &mut seen.is_evicting,
+        d_now.free,
+        low,
+        high,
+        cap_bytes,
+        cfg.daemon.max_items_per_cycle,
+    );
     rep.action = Some(action.clone());
     let now = SystemTime::now();
     let mut free_after_sampled = false;
@@ -338,7 +367,7 @@ pub fn run_cycle_sampling_opts(
 
                 let mut free_items = Vec::new();
                 for item in items {
-                    if let Some(why) = gates.check(&item.cand.path) {
+                    if let Some(why) = gates.check_candidate(&item.cand, now_emergency) {
                         seen.mark_active(&item.cand.path, SystemTime::now());
                         rep.skipped.push((item.cand.path.clone(), why));
                     } else {
@@ -347,11 +376,16 @@ pub fn run_cycle_sampling_opts(
                 }
 
                 let packed = plan::pack_capped(free_items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
-                let out = clean::apply_with(&packed.items, &crate::config::expand(&cfg.ledger), &|p| gates.check(p));
+                let out = clean::apply_with(&packed.items, &crate::config::expand(&cfg.ledger), &|cand| {
+                    gates.check_candidate(cand, now_emergency)
+                });
                 rep.removed = out.removed;
                 rep.freed = out.freed;
                 rep.free_after = sample_disk().free;
                 free_after_sampled = true;
+                if rep.free_after >= high {
+                    seen.is_evicting = false;
+                }
                 if out.removed > 0 {
                     seen.mark_eviction(now);
                     let removed: Vec<&Path> = packed
@@ -482,23 +516,43 @@ mod tests {
 
     #[test]
     fn idle_when_free_at_or_above_low() {
-        assert_eq!(decide_cycle(50 * G, 40 * G, 100 * G, 20 * G, 30), CycleAction::Idle);
-        assert_eq!(decide_cycle(40 * G, 40 * G, 100 * G, 20 * G, 30), CycleAction::Idle);
-        assert_eq!(decide_cycle(150 * G, 40 * G, 100 * G, 20 * G, 30), CycleAction::Idle);
+        let mut evicting = false;
+        assert_eq!(decide_cycle(&mut evicting, 50 * G, 40 * G, 100 * G, 20 * G, 30), CycleAction::Idle);
+        assert!(!evicting);
+        assert_eq!(decide_cycle(&mut evicting, 40 * G, 40 * G, 100 * G, 20 * G, 30), CycleAction::Idle);
+        assert!(!evicting);
+        assert_eq!(decide_cycle(&mut evicting, 150 * G, 40 * G, 100 * G, 20 * G, 30), CycleAction::Idle);
+        assert!(!evicting);
     }
 
     #[test]
     fn evicts_below_low_until_high() {
+        let mut evicting = false;
         assert_eq!(
-            decide_cycle(30 * G, 40 * G, 100 * G, 20 * G, 30),
+            decide_cycle(&mut evicting, 30 * G, 40 * G, 100 * G, 20 * G, 30),
             CycleAction::Evict { need_bytes: 70 * G, cap_bytes: 20 * G, cap_items: 30 }
         );
+        assert!(evicting);
+        // Hysteresis maintains eviction state across cycles even above low until high target
+        assert_eq!(
+            decide_cycle(&mut evicting, 50 * G, 40 * G, 100 * G, 20 * G, 30),
+            CycleAction::Evict { need_bytes: 50 * G, cap_bytes: 20 * G, cap_items: 30 }
+        );
+        assert!(evicting);
+        // Once high watermark target is reached, eviction terminates
+        assert_eq!(
+            decide_cycle(&mut evicting, 100 * G, 40 * G, 100 * G, 20 * G, 30),
+            CycleAction::Idle
+        );
+        assert!(!evicting);
     }
 
     #[test]
     fn inverted_or_satisfied_marks_are_idle() {
+        let mut evicting = false;
         // free < low but already ≥ high (inverted marks): removes nothing
-        assert_eq!(decide_cycle(50 * G, 60 * G, 40 * G, 20 * G, 30), CycleAction::Idle);
+        assert_eq!(decide_cycle(&mut evicting, 50 * G, 60 * G, 40 * G, 20 * G, 30), CycleAction::Idle);
+        assert!(!evicting);
     }
 
     #[test]

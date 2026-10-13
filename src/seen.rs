@@ -52,6 +52,10 @@ pub struct SeenDb {
     pub backoff_until: Option<SystemTime>,
     /// Consecutive breaker trips (backoff escalation: 1h, 2h, 4h … 24h cap).
     pub backoff_count: u32,
+    /// Whether the daemon is actively in an eviction cycle (hysteresis state).
+    /// Eviction is triggered when free < low_watermark, and continues across
+    /// cycles until free >= high_watermark (until_free_gib).
+    pub is_evicting: bool,
 }
 
 fn to_nanos(t: SystemTime) -> u64 {
@@ -81,6 +85,8 @@ struct SeenDbJson {
     backoff_until: Option<u64>,
     #[serde(default)]
     backoff_count: u32,
+    #[serde(default)]
+    is_evicting: bool,
 }
 
 impl SeenDb {
@@ -110,6 +116,7 @@ impl SeenDb {
             eviction_history: j.eviction_history,
             backoff_until: j.backoff_until.map(from_nanos),
             backoff_count: j.backoff_count,
+            is_evicting: j.is_evicting,
         }
     }
 
@@ -137,6 +144,7 @@ impl SeenDb {
             eviction_history: self.eviction_history.clone(),
             backoff_until: self.backoff_until.map(to_nanos),
             backoff_count: self.backoff_count,
+            is_evicting: self.is_evicting,
         };
         // atomic write: temp + rename in the same directory
         let tmp = path.with_extension("db.tmp");

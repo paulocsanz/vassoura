@@ -21,24 +21,28 @@ pub struct Outcome {
 ///    after the scan, eviction is aborted for that item;
 /// 4. every successful removal is born with a ledger line.
 pub fn apply(items: &[PlanItem], ledger_path: &Path) -> Outcome {
+    apply_policy(items, ledger_path, false)
+}
+
+pub fn apply_policy(items: &[PlanItem], ledger_path: &Path, emergency: bool) -> Outcome {
     // One lsof snapshot and one git status per repo, each with a kill
     // timeout. Per-candidate lsof/+D and git status serialized the cycle
     // behind a single wedged command.
     let paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
     let gates = crate::gates::prepare(&paths);
-    apply_with(items, ledger_path, &|p| gates.check(p))
+    apply_with(items, ledger_path, &|cand| gates.check_candidate(cand, emergency))
 }
 
 /// `apply` with an injectable in-use predicate (deterministic tests).
 pub fn apply_with(
     items: &[PlanItem],
     ledger_path: &Path,
-    in_use: &dyn Fn(&Path) -> Option<String>,
+    in_use: &dyn Fn(&crate::walk::Candidate) -> Option<String>,
 ) -> Outcome {
     let mut out = Outcome::default();
     for it in items {
         let path = &it.cand.path;
-        if let Some(why) = in_use(path) {
+        if let Some(why) = in_use(&it.cand) {
             out.skipped.push((path.clone(), why));
             continue;
         }
@@ -175,7 +179,7 @@ mod tests {
             item(&a, 200, 30, old_mtime),
             item(&b, 200, 30, stale_b),
         ];
-        let noop = |_p: &std::path::Path| None;
+        let noop = |_c: &crate::walk::Candidate| None;
         let out = apply_with(&items, &ledger, &noop);
 
         assert_eq!(out.removed, 1);
@@ -201,8 +205,8 @@ mod tests {
         let it = item(&a, 128, 30, old);
         let ledger = tmp.path().join("ledger.jsonl");
 
-        let gate = |p: &std::path::Path| {
-            (*p == a).then(|| "in use: process has a file open".to_string())
+        let gate = |c: &crate::walk::Candidate| {
+            (c.path == a).then(|| "in use: process has a file open".to_string())
         };
         let out = apply_with(std::slice::from_ref(&it), &ledger, &gate);
 

@@ -357,6 +357,16 @@ pub(crate) fn enumerate_app_cache_candidates(
         if rel_depth >= 4 {
             if let Ok(meta) = fs::symlink_metadata(scan_from) {
                 if meta.is_dir() && !meta.is_symlink() {
+                    if scan_from.file_name().and_then(|n| n.to_str()) == Some("com.google.Chrome.code_sign_clone") {
+                        if let Ok(sub_rd) = fs::read_dir(scan_from) {
+                            for sub_entry in sub_rd.flatten() {
+                                if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                                    candidates.push((sub_entry.path(), Class::AppCache));
+                                }
+                            }
+                        }
+                        return candidates;
+                    }
                     let class = if is_artifact_candidate_dir(scan_from, names) {
                         Class::Artifact
                     } else {
@@ -390,6 +400,16 @@ pub(crate) fn enumerate_app_cache_candidates(
                 for entry in rd.flatten() {
                     if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
                         let path = entry.path();
+                        if path.file_name().and_then(|n| n.to_str()) == Some("com.google.Chrome.code_sign_clone") {
+                            if let Ok(sub_rd) = fs::read_dir(&path) {
+                                for sub_entry in sub_rd.flatten() {
+                                    if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                                        candidates.push((sub_entry.path(), Class::AppCache));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         let class = if is_artifact_candidate_dir(&path, names) {
                             Class::Artifact
                         } else {
@@ -407,6 +427,16 @@ pub(crate) fn enumerate_app_cache_candidates(
         for entry in rd.flatten() {
             if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
                 let path = entry.path();
+                if path.file_name().and_then(|n| n.to_str()) == Some("com.google.Chrome.code_sign_clone") {
+                    if let Ok(sub_rd) = fs::read_dir(&path) {
+                        for sub_entry in sub_rd.flatten() {
+                            if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                                candidates.push((sub_entry.path(), Class::AppCache));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let class = if is_artifact_candidate_dir(&path, names) {
                     Class::Artifact
                 } else {
@@ -986,6 +1016,34 @@ mod tests {
         assert!(path_matches_root(Path::new("/Users/paulo/software"), Path::new("/Users/paulo/software")));
         assert!(!path_matches_root(Path::new("/etc/passwd"), Path::new("/tmp")));
         assert!(!path_matches_root(Path::new("/var/folders"), Path::new("/tmp")));
+    }
+
+    #[test]
+    fn darwin_var_folders_isolates_chrome_code_sign_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("var/folders");
+        let clone_dir = root.join("q_/hash_123/X/com.google.Chrome.code_sign_clone");
+        let clone1 = clone_dir.join("code_sign_clone.ABCDEF");
+        let clone2 = clone_dir.join("code_sign_clone.123456");
+        fs::create_dir_all(&clone1).unwrap();
+        fs::create_dir_all(&clone2).unwrap();
+        fs::write(clone1.join("Google Chrome"), vec![0u8; 100]).unwrap();
+        fs::write(clone2.join("Google Chrome"), vec![0u8; 100]).unwrap();
+
+        let cfg = Config {
+            app_cache_roots: vec![root],
+            ..Config::default()
+        };
+
+        let jobs = list_jobs(&cfg, None);
+        let paths: Vec<_> = jobs.into_iter().map(|j| match j {
+            ScanJob::Measure { path, .. } => path,
+            ScanJob::Hunt(p) => p,
+        }).collect();
+
+        assert!(!paths.contains(&clone_dir), "parent com.google.Chrome.code_sign_clone must not be candidate");
+        assert!(paths.contains(&clone1), "clone1 must be an independent leaf candidate");
+        assert!(paths.contains(&clone2), "clone2 must be an independent leaf candidate");
     }
 }
 

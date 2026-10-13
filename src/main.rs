@@ -326,7 +326,7 @@ fn cmd_clean(
         }
     }
 
-    let out = clean::apply(&packed.items, &config::expand(&cfg.ledger));
+    let out = clean::apply_policy(&packed.items, &config::expand(&cfg.ledger), is_critical);
     let after = disk_of(cfg);
     println!(
         "\nremoved: {} dirs · freed: {} · free now: {} (was {})",
@@ -376,7 +376,7 @@ fn cmd_daemon(cfg: &config::Config, once: bool) -> Result<ExitCode, String> {
     }
 }
 
-fn wait_between_cycles(cfg: &config::Config, _last_rep: &daemon::CycleReport) -> bool {
+fn wait_between_cycles(cfg: &config::Config, last_rep: &daemon::CycleReport) -> bool {
     let routine_interval = std::time::Duration::from_secs(cfg.watch_interval_secs.max(1));
     let probe_interval = std::time::Duration::from_secs(PROBE_INTERVAL_SECS);
     let start = std::time::Instant::now();
@@ -390,6 +390,7 @@ fn wait_between_cycles(cfg: &config::Config, _last_rep: &daemon::CycleReport) ->
 
         let d = disk_of(cfg);
         let low = (cfg.low_watermark_gib * GIB as f64) as u64;
+        let high = (cfg.until_free_gib * GIB as f64) as u64;
         if d.free < low || d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT {
             println!(
                 "  → fast probe: {} free ({:.1}% used >= {:.0}% or below low {} GiB) · waking daemon to act immediately",
@@ -400,6 +401,20 @@ fn wait_between_cycles(cfg: &config::Config, _last_rep: &daemon::CycleReport) ->
             );
             let _ = std::io::stdout().flush();
             return true;
+        }
+
+        let rl = std::time::Duration::from_secs(cfg.daemon.rate_limit_secs);
+        if matches!(last_rep.action, Some(daemon::CycleAction::Evict { .. }))
+            && d.free < high
+            && start.elapsed() >= rl
+        {
+            println!(
+                "  → hysteresis probe: {} free (< high target {} GiB) · waking daemon to continue eviction",
+                human(d.free),
+                cfg.until_free_gib
+            );
+            let _ = std::io::stdout().flush();
+            return false;
         }
     }
     false
