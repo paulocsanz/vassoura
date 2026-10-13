@@ -362,11 +362,17 @@ pub fn run_cycle_sampling_opts(
             if !now_emergency && rate_limited(seen.last_eviction, now, rl) {
                 rep.rate_limited = true;
             } else if need_bytes > 0 {
-                let candidate_paths: Vec<&Path> = items.iter().map(|i| i.cand.path.as_path()).collect();
+                // Invariant & Performance: only gate-check a bounded window of the highest-scoring
+                // candidates (up to 3x cap_items, clamped between 60 and 150). Full seen sets can contain
+                // 5,000+ items; running git status or lsof checks on thousands of paths under disk pressure
+                // is slow and triggers lsof timeout deadlocks.
+                let check_window = (cap_items * 3).clamp(60, 150);
+                let check_items: Vec<_> = items.into_iter().take(check_window).collect();
+                let candidate_paths: Vec<&Path> = check_items.iter().map(|i| i.cand.path.as_path()).collect();
                 let gates = crate::gates::prepare(&candidate_paths);
 
                 let mut free_items = Vec::new();
-                for item in items {
+                for item in check_items {
                     if let Some(why) = gates.check_candidate(&item.cand, now_emergency) {
                         seen.mark_active(&item.cand.path, SystemTime::now());
                         rep.skipped.push((item.cand.path.clone(), why));

@@ -42,6 +42,16 @@ Watermarked build-artifact collector (Rust CLI + daemon).
    multi-tenant, in perpetual use by daemons). Enumeration traverses to depth 4
    so each discrete directory (Playwright artifacts, test dirs, browser caches)
    is an independent candidate, preventing wedge/timeout on 90,000 files in one job.
+8. **nested-app-cache-leaf-isolation** (2026-10 incident): monolithic cache trees whose
+   root directories are perpetually touched by live apps (e.g. Chrome code sign clones
+   or Claude Desktop scratchpads in `/tmp/claude-*`) are expanded to discrete leaf session
+   candidates. This ensures dead sessions/clones are individually collectible without
+   parent mtime freshness starving cleanup.
+9. **candidate-gate-windowing** (2026-10 incident): daemon cycles evaluate use gates
+   (lsof and git status) only on a bounded top-scoring window (up to 3x `cap_items`).
+   Evaluating gates against thousands of candidates causes lsof timeouts and git contention
+   under I/O pressure. On emergency disk pressure, lsof timeouts do not block regenerable
+   artifact eviction.
 
 ## Working rules
 

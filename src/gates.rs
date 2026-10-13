@@ -217,20 +217,21 @@ impl GateSession {
     }
 
     pub fn check_candidate_policy(&self, path: &Path, class: Class, emergency: bool) -> Option<String> {
-        if let Some(err) = &self.lsof_err {
-            return Some(format!("in use unavailable (fail-closed): {err}"));
-        }
         if open_under(&self.open_paths, path) {
             return Some("in use: process has a file open (lsof)".into());
         }
-        // In an emergency (disk >= 95% full or free space below low watermark), OS survival
+        // In an emergency (disk >= 95% full or forced cycle), OS survival
         // takes priority over incremental build caches: pure regenerable artifacts
         // (target, node_modules, .venv, etc.) and app caches whose files are not held open
-        // by any process can be evicted even if the containing repo has uncommitted edits.
+        // by any process can be evicted even if the containing repo has uncommitted edits,
+        // or if system-wide lsof timed out under extreme pressure.
         // Class::Worktree checkouts NEVER bypass this: a dirty worktree checkout contains
         // uncommitted user source code and must never be deleted!
         if emergency && class != Class::Worktree {
             return None;
+        }
+        if let Some(err) = &self.lsof_err {
+            return Some(format!("in use unavailable (fail-closed): {err}"));
         }
         if let Some(repo) = nearest_repo(path) {
             if let Some(res) = self.git.get(&repo) {

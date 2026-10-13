@@ -321,6 +321,52 @@ pub(crate) fn path_matches_root(path: &Path, root: &Path) -> bool {
     false
 }
 
+/// Discovers nested leaf cache directories inside monolithic application temp/cache roots.
+///
+/// Certain applications (e.g. Chrome code sign clones, Claude Desktop scratchpads)
+/// maintain a top-level directory whose mtime is perpetually refreshed by daemon or
+/// background activity. Evicting at the parent level either fails because files are in use,
+/// or starves cleanup because the root never crosses the minimum age threshold.
+/// This helper expands them to their discrete leaf session/clone candidates.
+pub(crate) fn expand_nested_cache_leaves(
+    path: &Path,
+    candidates: &mut Vec<(PathBuf, Class)>,
+) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "com.google.Chrome.code_sign_clone" {
+        if let Ok(sub_rd) = fs::read_dir(path) {
+            for sub_entry in sub_rd.flatten() {
+                if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                    candidates.push((sub_entry.path(), Class::AppCache));
+                }
+            }
+        }
+        return true;
+    }
+    if name.starts_with("claude-") {
+        if let Ok(sub_rd) = fs::read_dir(path) {
+            for sub_entry in sub_rd.flatten() {
+                if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                    let mut found_session = false;
+                    if let Ok(sess_rd) = fs::read_dir(sub_entry.path()) {
+                        for sess_entry in sess_rd.flatten() {
+                            if sess_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                                candidates.push((sess_entry.path(), Class::AppCache));
+                                found_session = true;
+                            }
+                        }
+                    }
+                    if !found_session {
+                        candidates.push((sub_entry.path(), Class::AppCache));
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Enumerate candidate directories inside an `app_cache_roots` entry.
 ///
 /// For standard cache roots (e.g. `~/Library/Caches`, `/private/tmp`), this
@@ -357,14 +403,7 @@ pub(crate) fn enumerate_app_cache_candidates(
         if rel_depth >= 4 {
             if let Ok(meta) = fs::symlink_metadata(scan_from) {
                 if meta.is_dir() && !meta.is_symlink() {
-                    if scan_from.file_name().and_then(|n| n.to_str()) == Some("com.google.Chrome.code_sign_clone") {
-                        if let Ok(sub_rd) = fs::read_dir(scan_from) {
-                            for sub_entry in sub_rd.flatten() {
-                                if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
-                                    candidates.push((sub_entry.path(), Class::AppCache));
-                                }
-                            }
-                        }
+                    if expand_nested_cache_leaves(scan_from, &mut candidates) {
                         return candidates;
                     }
                     let class = if is_artifact_candidate_dir(scan_from, names) {
@@ -400,14 +439,7 @@ pub(crate) fn enumerate_app_cache_candidates(
                 for entry in rd.flatten() {
                     if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
                         let path = entry.path();
-                        if path.file_name().and_then(|n| n.to_str()) == Some("com.google.Chrome.code_sign_clone") {
-                            if let Ok(sub_rd) = fs::read_dir(&path) {
-                                for sub_entry in sub_rd.flatten() {
-                                    if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
-                                        candidates.push((sub_entry.path(), Class::AppCache));
-                                    }
-                                }
-                            }
+                        if expand_nested_cache_leaves(&path, &mut candidates) {
                             continue;
                         }
                         let class = if is_artifact_candidate_dir(&path, names) {
@@ -427,14 +459,7 @@ pub(crate) fn enumerate_app_cache_candidates(
         for entry in rd.flatten() {
             if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
                 let path = entry.path();
-                if path.file_name().and_then(|n| n.to_str()) == Some("com.google.Chrome.code_sign_clone") {
-                    if let Ok(sub_rd) = fs::read_dir(&path) {
-                        for sub_entry in sub_rd.flatten() {
-                            if sub_entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
-                                candidates.push((sub_entry.path(), Class::AppCache));
-                            }
-                        }
-                    }
+                if expand_nested_cache_leaves(&path, &mut candidates) {
                     continue;
                 }
                 let class = if is_artifact_candidate_dir(&path, names) {
@@ -1044,6 +1069,36 @@ mod tests {
         assert!(!paths.contains(&clone_dir), "parent com.google.Chrome.code_sign_clone must not be candidate");
         assert!(paths.contains(&clone1), "clone1 must be an independent leaf candidate");
         assert!(paths.contains(&clone2), "clone2 must be an independent leaf candidate");
+    }
+
+    #[test]
+    fn app_cache_isolates_claude_scratchpads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tmp");
+        let claude_dir = root.join("claude-501");
+        let proj_dir = claude_dir.join("-Users-paulo-software-demo");
+        let sess1 = proj_dir.join("11111111-2222-3333-4444-555555555555");
+        let sess2 = proj_dir.join("66666666-7777-8888-9999-000000000000");
+        fs::create_dir_all(&sess1).unwrap();
+        fs::create_dir_all(&sess2).unwrap();
+        fs::write(sess1.join("scratchpad"), b"hello").unwrap();
+        fs::write(sess2.join("scratchpad"), b"world").unwrap();
+
+        let cfg = Config {
+            app_cache_roots: vec![root],
+            ..Config::default()
+        };
+
+        let jobs = list_jobs(&cfg, None);
+        let paths: Vec<_> = jobs.into_iter().map(|j| match j {
+            ScanJob::Measure { path, .. } => path,
+            ScanJob::Hunt(p) => p,
+        }).collect();
+
+        assert!(!paths.contains(&claude_dir), "parent claude-501 must not be candidate");
+        assert!(!paths.contains(&proj_dir), "project dir inside claude-501 must not be candidate when sessions exist");
+        assert!(paths.contains(&sess1), "sess1 must be an independent leaf candidate");
+        assert!(paths.contains(&sess2), "sess2 must be an independent leaf candidate");
     }
 }
 
