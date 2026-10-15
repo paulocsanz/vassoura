@@ -52,6 +52,18 @@ Watermarked build-artifact collector (Rust CLI + daemon).
    Evaluating gates against thousands of candidates causes lsof timeouts and git contention
    under I/O pressure. On emergency disk pressure, lsof timeouts do not block regenerable
    artifact eviction.
+10. **monorepo-subproject-promotion** (2026-10 incident): monorepo or container
+   workspaces with subproject build artifacts (e.g. `forja/engine/target`,
+   `janela/escritorio/target`, or subprojects inside non-git container dirs)
+   promote shallow artifacts down to depth 3 to `ScanJob::Measure` immediately.
+   This ensures multi-gigabyte subproject build artifacts run in the first 500ms
+   of the scan rather than starving behind thousands of app cache items in `Hunt`.
+11. **transient-search-and-virtiofs-gate-isolation** (2026-10 incident): transient
+   read-only searches (`grep`, `rg`, `find`, `mdworker`) and Linux guest VFS
+   inode caches via Apple Virtualization framework / VirtioFS (`com.apple.Virtualization.*`)
+   are isolated from active host compiler/build processes. Read-only search tools
+   never block artifact eviction, and in emergency disk pressure (>= 98% / forced cycle),
+   idle VirtioFS guest handles do not block regenerable artifact eviction.
 
 ## Working rules
 

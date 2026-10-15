@@ -588,11 +588,21 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
     measure_jobs
 }
 
-fn has_sub_repos(dir: &Path) -> bool {
+fn has_sub_projects_or_repos(dir: &Path) -> bool {
     let Ok(rd) = fs::read_dir(dir) else { return false };
     for entry in rd.flatten() {
-        if entry.path().join(".git").exists() {
-            return true;
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() && !ft.is_symlink() {
+                let p = entry.path();
+                if p.join(".git").exists()
+                    || p.join("Cargo.toml").exists()
+                    || p.join("package.json").exists()
+                    || p.join("pyproject.toml").exists()
+                    || p.join("go.mod").exists()
+                {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -613,8 +623,8 @@ fn split_root(dir: &Path, names: &HashSet<&str>, prune: &HashSet<&str>) -> Vec<S
         }
         if names.contains(name.as_ref()) {
             jobs.push(ScanJob::Measure { path: entry.path(), class: Class::Artifact });
-        } else if !entry.path().join(".git").exists() && has_sub_repos(&entry.path()) {
-            // Container directory without its own .git (e.g. software/railway):
+        } else if !entry.path().join(".git").exists() && has_sub_projects_or_repos(&entry.path()) {
+            // Container directory without its own .git (e.g. software/railway, software/estrutura):
             // split its immediate children into jobs so parallel workers can balance
             // sub-projects across the pool instead of one worker doing 100 repos alone.
             let sub = split_root(&entry.path(), names, prune);
@@ -624,26 +634,47 @@ fn split_root(dir: &Path, names: &HashSet<&str>, prune: &HashSet<&str>) -> Vec<S
                 jobs.extend(sub);
             }
         } else {
-            // Check for immediate shallow artifacts in this repository/project directory
-            // (e.g. pedradb/target, centro/target, etc.) and promote them to Measure jobs
-            // so they are prioritized ahead of deep recursive Hunt scans.
-            if let Ok(sub_rd) = fs::read_dir(entry.path()) {
-                for sub_entry in sub_rd.flatten() {
-                    let sub_name = sub_entry.file_name();
-                    let sub_name = sub_name.to_string_lossy();
-                    if names.contains(sub_name.as_ref()) {
-                        if let Ok(sft) = sub_entry.file_type() {
-                            if sft.is_dir() && !sft.is_symlink() {
-                                jobs.push(ScanJob::Measure { path: sub_entry.path(), class: Class::Artifact });
-                            }
-                        }
-                    }
-                }
-            }
+            // Check for shallow artifacts in this repository/workspace directory
+            // up to depth 3 (e.g. pedradb/target, forja/engine/target, janela/escritorio/target)
+            // and promote them to Measure jobs so they are prioritized ahead of deep
+            // recursive Hunt scans.
+            find_shallow_artifacts(&entry.path(), 3, names, prune, &mut jobs);
             jobs.push(ScanJob::Hunt(entry.path()));
         }
     }
     jobs
+}
+
+fn find_shallow_artifacts(
+    dir: &Path,
+    depth: usize,
+    names: &HashSet<&str>,
+    prune: &HashSet<&str>,
+    jobs: &mut Vec<ScanJob>,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if prune.contains(name_str.as_ref()) {
+            continue;
+        }
+        if names.contains(name_str.as_ref()) {
+            jobs.push(ScanJob::Measure {
+                path: entry.path(),
+                class: Class::Artifact,
+            });
+        } else if depth > 1 {
+            find_shallow_artifacts(&entry.path(), depth - 1, names, prune, jobs);
+        }
+    }
 }
 
 /// Manual recursion: on a regenerable name, measure and do NOT descend
@@ -1099,6 +1130,57 @@ mod tests {
         assert!(!paths.contains(&proj_dir), "project dir inside claude-501 must not be candidate when sessions exist");
         assert!(paths.contains(&sess1), "sess1 must be an independent leaf candidate");
         assert!(paths.contains(&sess2), "sess2 must be an independent leaf candidate");
+    }
+
+    #[test]
+    fn split_root_splits_containers_with_manifest_subprojects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("software");
+        let container = root.join("estrutura");
+        let subproj = container.join("prumo");
+        let target = subproj.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(subproj.join("Cargo.toml"), b"[package]\nname = \"prumo\"\nversion = \"0.1.0\"\n").unwrap();
+        fs::write(target.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55").unwrap();
+
+        let cfg = Config {
+            artifact_roots: vec![root],
+            ..Config::default()
+        };
+
+        let jobs = list_jobs(&cfg, None);
+        let measure_paths: Vec<_> = jobs.into_iter().filter_map(|j| match j {
+            ScanJob::Measure { path, .. } => Some(path),
+            ScanJob::Hunt(..) => None,
+        }).collect();
+
+        assert!(measure_paths.contains(&target), "target inside non-git container subproject must be promoted to Measure job");
+    }
+
+    #[test]
+    fn split_root_promotes_monorepo_subproject_artifacts_to_measure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("software");
+        let repo = root.join("forja");
+        let subproj = repo.join("engine");
+        let target = subproj.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(subproj.join("Cargo.toml"), b"[package]\nname = \"engine\"\nversion = \"0.1.0\"\n").unwrap();
+        fs::write(target.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55").unwrap();
+
+        let cfg = Config {
+            artifact_roots: vec![root],
+            ..Config::default()
+        };
+
+        let jobs = list_jobs(&cfg, None);
+        let measure_paths: Vec<_> = jobs.into_iter().filter_map(|j| match j {
+            ScanJob::Measure { path, .. } => Some(path),
+            ScanJob::Hunt(..) => None,
+        }).collect();
+
+        assert!(measure_paths.contains(&target), "target inside monorepo subproject must be promoted to Measure job");
     }
 }
 

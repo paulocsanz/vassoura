@@ -319,7 +319,9 @@ pub fn run_cycle_sampling_opts(
 
     let now_emergency = force || d_now.used_percent() >= EMERGENCY_USED_PERCENT;
 
-    let min_override = if d_now.free < low || now_emergency {
+    let min_override = if now_emergency {
+        Some(crate::config::MIN_AGE_FLOOR_DAYS)
+    } else if d_now.free < low {
         Some(cfg.min_age_days_tight)
     } else {
         None

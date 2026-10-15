@@ -239,9 +239,16 @@ fn cmd_clean(
     let high = (cfg.until_free_gib * GIB as f64) as u64;
     let is_critical = d_init.free < low || d_init.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
     let is_tight = d_init.free < high || d_init.used_percent() >= 90.0;
+    let is_emergency = d_init.used_percent() >= daemon::EMERGENCY_USED_PERCENT;
     let effective_older_than = older_than
         .map(|d| d as f64)
-        .or_else(|| is_critical.then_some(cfg.min_age_days_tight));
+        .or(if is_emergency {
+            Some(vassoura::config::MIN_AGE_FLOOR_DAYS)
+        } else if is_tight {
+            Some(cfg.min_age_days_tight)
+        } else {
+            None
+        });
     let until = until_free.unwrap_or(cfg.until_free_gib);
     let deadline = if is_critical {
         Some(std::time::Duration::from_secs(30))

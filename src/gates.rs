@@ -187,9 +187,25 @@ pub fn in_use(path: &Path) -> Option<String> {
 /// Gates for a whole plan: git status runs once per repo (in parallel),
 /// lsof runs once for the machine. A command that does not return is killed
 /// and fails closed for that repo or that snapshot only.
+fn is_vm_hypervisor(cmd: &str) -> bool {
+    cmd.starts_with("com.apple.Virtualization.") || cmd.starts_with("qemu-") || cmd == "virtiofsd"
+}
+
+fn is_transient_search_or_indexer(cmd: &str) -> bool {
+    let base = cmd.rsplit('/').next().unwrap_or(cmd);
+    matches!(
+        base,
+        "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" | "ag" | "ack" | "find" |
+        "mdfind" | "mds" | "mdworker" | "mdworker_shared" | "fseventsd" |
+        "file" | "stat" | "cat" | "head" | "tail" | "wc" | "less" | "more" |
+        "strings" | "nm" | "objdump" | "otool"
+    )
+}
+
 pub struct GateSession {
     git: std::collections::HashMap<PathBuf, Result<Vec<PathBuf>, String>>,
     open_paths: Vec<PathBuf>,
+    vm_open_paths: Vec<PathBuf>,
     lsof_err: Option<String>,
 }
 
@@ -197,14 +213,14 @@ pub fn prepare(paths: &[&Path]) -> GateSession {
     use std::collections::HashSet;
     let repos: HashSet<PathBuf> = paths.iter().filter_map(|p| nearest_repo(p)).collect();
     let git = git_many(repos);
-    let (open_paths, lsof_err) = match lsof_snapshot() {
-        Ok(paths) => (paths, None),
+    let ((open_paths, vm_open_paths), lsof_err) = match lsof_snapshot() {
+        Ok(res) => (res, None),
         Err(e) => match lsof_batch_cwd_timeout(paths) {
-            Ok(batch_paths) => (batch_paths, None),
-            Err(batch_err) => (Vec::new(), Some(format!("{e}; batch probe: {batch_err}"))),
+            Ok(batch_paths) => ((batch_paths, Vec::new()), None),
+            Err(batch_err) => ((Vec::new(), Vec::new()), Some(format!("{e}; batch probe: {batch_err}"))),
         },
     };
-    GateSession { git, open_paths, lsof_err }
+    GateSession { git, open_paths, vm_open_paths, lsof_err }
 }
 
 impl GateSession {
@@ -219,6 +235,9 @@ impl GateSession {
     pub fn check_candidate_policy(&self, path: &Path, class: Class, emergency: bool) -> Option<String> {
         if open_under(&self.open_paths, path) {
             return Some("in use: process has a file open (lsof)".into());
+        }
+        if !emergency && open_under(&self.vm_open_paths, path) {
+            return Some("in use: VM hypervisor has a file open (virtiofs)".into());
         }
         // In an emergency (disk >= 95% full or forced cycle), OS survival
         // takes priority over incremental build caches: pure regenerable artifacts
@@ -276,20 +295,36 @@ fn git_dirty_files_timeout(repo: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// One `lsof` for every open file. Killed if it does not finish: the cycle
 /// then falls back to a single batch check on the candidate paths.
-fn lsof_snapshot() -> Result<Vec<PathBuf>, String> {
+fn lsof_snapshot() -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let out = crate::procutil::output_with_timeout(
-        Command::new("lsof").args(["-n", "-P", "-w", "-F", "n"]),
+        Command::new("lsof").args(["-n", "-P", "-w", "-F", "cn"]),
         std::time::Duration::from_secs(45),
     )?;
     let mut paths = Vec::new();
+    let mut vm_paths = Vec::new();
+    let mut is_vm = false;
+    let mut is_transient = false;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        // -F n lines are "n" + the path. Skip the field marker.
+        if let Some(cmd) = line.strip_prefix('c') {
+            let cmd_name = cmd.trim();
+            is_vm = is_vm_hypervisor(cmd_name);
+            is_transient = is_transient_search_or_indexer(cmd_name);
+            continue;
+        }
         let Some(rest) = line.strip_prefix('n') else { continue };
+        if is_transient {
+            continue;
+        }
         if rest.starts_with('/') {
-            paths.push(PathBuf::from(rest));
+            let p = PathBuf::from(rest);
+            if is_vm {
+                vm_paths.push(p);
+            } else {
+                paths.push(p);
+            }
         }
     }
-    Ok(paths)
+    Ok((paths, vm_paths))
 }
 
 fn lsof_batch_cwd_timeout(paths: &[&Path]) -> Result<Vec<PathBuf>, String> {
@@ -299,14 +334,25 @@ fn lsof_batch_cwd_timeout(paths: &[&Path]) -> Result<Vec<PathBuf>, String> {
     let mut opens = Vec::new();
     for chunk in paths.chunks(100) {
         let mut cmd = Command::new("lsof");
-        cmd.args(["-n", "-P", "-w", "-F", "pn", "--"]);
+        cmd.args(["-n", "-P", "-w", "-F", "cn", "--"]);
         for p in chunk {
             cmd.arg(p);
         }
         let out = crate::procutil::output_with_timeout(&mut cmd, std::time::Duration::from_secs(15))?;
+        let mut is_vm = false;
+        let mut is_transient = false;
         for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(cmd) = line.strip_prefix('c') {
+                let cmd_name = cmd.trim();
+                is_vm = is_vm_hypervisor(cmd_name);
+                is_transient = is_transient_search_or_indexer(cmd_name);
+                continue;
+            }
             let Some(rest) = line.strip_prefix('n') else { continue };
-            if rest.starts_with('/') {
+            if is_transient {
+                continue;
+            }
+            if rest.starts_with('/') && !is_vm {
                 opens.push(PathBuf::from(rest));
             }
         }
@@ -569,4 +615,50 @@ mod tests {
         assert!(session.check_candidate(&art_cand, true).is_none(), "artifact allowed in emergency even if repo is dirty");
         assert!(session.check_candidate(&wt_cand, true).is_some(), "worktree NEVER removed in emergency if dirty");
     }
+
+    #[test]
+    fn vm_hypervisor_paths_skipped_in_normal_mode_but_bypassed_in_emergency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let cand = Candidate {
+            path: target.clone(),
+            class: Class::Artifact,
+            bytes: 1024 * 1024,
+            newest_mtime: std::time::SystemTime::now(),
+            root_mtime: std::time::SystemTime::now(),
+            contains_git: false,
+            entries: 10,
+        };
+
+        let session = GateSession {
+            git: std::collections::HashMap::new(),
+            open_paths: Vec::new(),
+            vm_open_paths: vec![target.join("debug/libfoo.rlib")],
+            lsof_err: None,
+        };
+
+        // Normal mode: skipped as held by VM virtiofs
+        let normal_skip = session.check_candidate(&cand, false);
+        assert!(normal_skip.is_some(), "normal mode must skip VM held files");
+        assert!(normal_skip.unwrap().contains("VM hypervisor"));
+
+        // Emergency mode: bypassed so host disk does not fill to 0 bytes
+        let emergency_skip = session.check_candidate(&cand, true);
+        assert!(emergency_skip.is_none(), "emergency mode must bypass VM held files");
+    }
+
+    #[test]
+    fn transient_search_and_indexers_are_recognized() {
+        assert!(is_transient_search_or_indexer("grep"));
+        assert!(is_transient_search_or_indexer("/usr/bin/grep"));
+        assert!(is_transient_search_or_indexer("rg"));
+        assert!(is_transient_search_or_indexer("find"));
+        assert!(is_transient_search_or_indexer("mdworker"));
+        assert!(!is_transient_search_or_indexer("rustc"));
+        assert!(!is_transient_search_or_indexer("cargo"));
+        assert!(!is_transient_search_or_indexer("node"));
+    }
 }
+
