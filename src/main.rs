@@ -168,10 +168,18 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
     let d = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
+    let emergency_free_bytes = (vassoura::config::EMERGENCY_FREE_GIB_FLOOR * GIB as f64) as u64;
+    let is_emergency = d.used_percent() >= daemon::EMERGENCY_USED_PERCENT || d.free < emergency_free_bytes;
     let is_critical = d.free < low || d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
     let is_tight = d.free < high || d.used_percent() >= 90.0;
-    let tight_override = is_critical.then_some(cfg.min_age_days_tight);
-    let deadline = if is_critical {
+    let tight_override = if is_emergency {
+        Some(vassoura::config::EMERGENCY_MIN_AGE_FLOOR_DAYS)
+    } else if is_critical {
+        Some(cfg.min_age_days_tight)
+    } else {
+        None
+    };
+    let deadline = if is_emergency || is_critical {
         Some(std::time::Duration::from_secs(30))
     } else if is_tight {
         Some(std::time::Duration::from_secs(45))
@@ -179,7 +187,7 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
         Some(std::time::Duration::from_secs(90))
     };
     let cands = walk::scan_with(cfg, None, false, deadline);
-    let (items, rejected) = plan::build(cands, cfg, tight_override);
+    let (items, rejected) = plan::build_emergency(cands, cfg, tight_override, is_emergency);
     let eligible: u64 = items.iter().map(|i| i.cand.bytes).sum();
     let report = statusfs::build_report(d, cfg, eligible, items.len());
 
@@ -193,7 +201,13 @@ fn cmd_status(cfg: &config::Config, top: usize, json: bool) -> Result<ExitCode, 
         "watermarks: low {} GiB (daemon trigger) · high target {} GiB",
         cfg.low_watermark_gib, cfg.until_free_gib
     );
-    let verdict = if d.free < low {
+    let verdict = if is_emergency {
+        format!(
+            "EMERGENCY — critical disk pressure (emergency mode: {} min age; emergency floor {})",
+            plan::fmt_age_short(vassoura::config::EMERGENCY_MIN_AGE_FLOOR_DAYS),
+            plan::fmt_age_short(vassoura::config::EMERGENCY_MIN_AGE_FLOOR_DAYS)
+        )
+    } else if d.free < low {
         format!(
             "CRITICAL — below the low watermark (tight mode: {} min age; hard floor {})",
             plan::fmt_age_short(cfg.tight_min_age()),
@@ -237,20 +251,21 @@ fn cmd_clean(
     let d_init = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
     let high = (cfg.until_free_gib * GIB as f64) as u64;
+    let emergency_free_bytes = (vassoura::config::EMERGENCY_FREE_GIB_FLOOR * GIB as f64) as u64;
+    let is_emergency = d_init.used_percent() >= daemon::EMERGENCY_USED_PERCENT || d_init.free < emergency_free_bytes;
     let is_critical = d_init.free < low || d_init.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
     let is_tight = d_init.free < high || d_init.used_percent() >= 90.0;
-    let is_emergency = d_init.used_percent() >= daemon::EMERGENCY_USED_PERCENT;
     let effective_older_than = older_than
         .map(|d| d as f64)
         .or(if is_emergency {
-            Some(vassoura::config::MIN_AGE_FLOOR_DAYS)
+            Some(vassoura::config::EMERGENCY_MIN_AGE_FLOOR_DAYS)
         } else if is_tight {
             Some(cfg.min_age_days_tight)
         } else {
             None
         });
     let until = until_free.unwrap_or(cfg.until_free_gib);
-    let deadline = if is_critical {
+    let deadline = if is_emergency || is_critical {
         Some(std::time::Duration::from_secs(30))
     } else if is_tight {
         Some(std::time::Duration::from_secs(45))
@@ -258,13 +273,21 @@ fn cmd_clean(
         Some(std::time::Duration::from_secs(90))
     };
     let cands = walk::scan_with(cfg, root, false, deadline);
-    let (items, rejected) = plan::build(cands, cfg, effective_older_than);
+    let (items, rejected) = plan::build_emergency(cands, cfg, effective_older_than, is_emergency);
     // Re-stat after the scan: the plan uses free space now. The walk is long
     // and the disk moves during it — the same bug as the daemon cycle.
     let d = disk_of(cfg);
     let packed = plan::pack(items, d.free, until, top);
 
-    if is_critical && older_than.is_none() {
+    if is_emergency && older_than.is_none() {
+        println!(
+            "# emergency mode active (disk >= {:.0}% or < {:.0} GiB): using min age {} (emergency floor {})",
+            daemon::EMERGENCY_USED_PERCENT,
+            vassoura::config::EMERGENCY_FREE_GIB_FLOOR,
+            plan::fmt_age_short(vassoura::config::EMERGENCY_MIN_AGE_FLOOR_DAYS),
+            plan::fmt_age_short(vassoura::config::EMERGENCY_MIN_AGE_FLOOR_DAYS)
+        );
+    } else if is_critical && older_than.is_none() {
         println!(
             "# tight mode active (< {:.0} GiB watermark): using min age {} (hard floor {})",
             cfg.low_watermark_gib,
@@ -354,12 +377,19 @@ const PROBE_INTERVAL_SECS: u64 = 30;
 fn cmd_daemon(cfg: &config::Config, once: bool) -> Result<ExitCode, String> {
     let d_init = disk_of(cfg);
     let low = (cfg.low_watermark_gib * GIB as f64) as u64;
-    let mut force_next = d_init.free < low || d_init.used_percent() >= daemon::FAST_PROBE_USED_PERCENT;
+    let emergency_free_bytes = (vassoura::config::EMERGENCY_FREE_GIB_FLOOR * GIB as f64) as u64;
+    let mut force_next = d_init.free < low
+        || d_init.used_percent() >= daemon::FAST_PROBE_USED_PERCENT
+        || d_init.free < emergency_free_bytes;
     let mut scan_state = daemon::ScanHealthState::default();
     loop {
         let mode = if scan_state.probe_mode { daemon::ScanMode::Probe } else { daemon::ScanMode::Full };
         let rep = if mode == daemon::ScanMode::Probe {
-            daemon::run_cycle_probe(cfg)
+            if force_next {
+                daemon::run_cycle_probe_forced(cfg)
+            } else {
+                daemon::run_cycle_probe(cfg)
+            }
         } else if force_next {
             daemon::run_cycle_forced(cfg)
         } else {
@@ -398,13 +428,15 @@ fn wait_between_cycles(cfg: &config::Config, last_rep: &daemon::CycleReport) -> 
         let d = disk_of(cfg);
         let low = (cfg.low_watermark_gib * GIB as f64) as u64;
         let high = (cfg.until_free_gib * GIB as f64) as u64;
-        if d.free < low || d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT {
+        let emergency_free_bytes = (vassoura::config::EMERGENCY_FREE_GIB_FLOOR * GIB as f64) as u64;
+        if d.free < low || d.used_percent() >= daemon::FAST_PROBE_USED_PERCENT || d.free < emergency_free_bytes {
             println!(
-                "  → fast probe: {} free ({:.1}% used >= {:.0}% or below low {} GiB) · waking daemon to act immediately",
+                "  → fast probe: {} free ({:.1}% used >= {:.0}% or below low {} GiB / floor {} GiB) · waking daemon to act immediately",
                 human(d.free),
                 d.used_percent(),
                 daemon::FAST_PROBE_USED_PERCENT,
-                cfg.low_watermark_gib
+                cfg.low_watermark_gib,
+                vassoura::config::EMERGENCY_FREE_GIB_FLOOR
             );
             let _ = std::io::stdout().flush();
             return true;

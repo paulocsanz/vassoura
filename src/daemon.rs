@@ -244,6 +244,12 @@ pub fn run_cycle_probe(cfg: &Config) -> CycleReport {
     run_cycle_sampling_opts(cfg, || disk_of(cfg), false, ScanMode::Probe)
 }
 
+/// Run shallow-probe cycle with forced eviction (e.g. when woken by fast probe on critical disk >= 95%
+/// while scan workers are degraded).
+pub fn run_cycle_probe_forced(cfg: &Config) -> CycleReport {
+    run_cycle_sampling_opts(cfg, || disk_of(cfg), true, ScanMode::Probe)
+}
+
 /// Run cycle with forced eviction (skips the rate-limit and churn backoff,
 /// e.g. when woken by fast probe on critical disk usage >= 95%).
 /// On critical disk, OS survival takes absolute priority over churn backoff.
@@ -267,7 +273,8 @@ pub fn run_cycle_sampling_opts(
     let d = sample_disk();
     rep.free_before = d.free;
 
-    let is_emergency = force || d.used_percent() >= FAST_PROBE_USED_PERCENT;
+    let emergency_free_bytes = (crate::config::EMERGENCY_FREE_GIB_FLOOR * GIB as f64) as u64;
+    let is_emergency = force || d.used_percent() >= FAST_PROBE_USED_PERCENT || d.free < emergency_free_bytes;
     let low_now = (cfg.low_watermark_gib * GIB as f64) as u64;
     let deadline = if d.free < low_now || d.used_percent() >= 90.0 {
         Some(Duration::from_secs(45))
@@ -320,7 +327,7 @@ pub fn run_cycle_sampling_opts(
     let now_emergency = force || d_now.used_percent() >= EMERGENCY_USED_PERCENT;
 
     let min_override = if now_emergency {
-        Some(crate::config::MIN_AGE_FLOOR_DAYS)
+        Some(crate::config::EMERGENCY_MIN_AGE_FLOOR_DAYS)
     } else if d_now.free < low {
         Some(cfg.min_age_days_tight)
     } else {

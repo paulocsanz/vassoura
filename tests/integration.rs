@@ -243,7 +243,9 @@ fn daemon_cycle_triggers_bounded_and_ledgers_each_removal() {
         ..sandbox_cfg(root.clone(), home.clone())
     };
 
-    let rep = vassoura::daemon::run_cycle(&cfg);
+    let gib = 1024u64 * 1024 * 1024;
+    let normal_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 30 * gib };
+    let rep = vassoura::daemon::run_cycle_sampling(&cfg, normal_disk);
 
     assert_eq!(rep.removed, 2, "bound of 2 items per cycle: {:?}", rep.skipped);
     assert!(matches!(rep.action, Some(vassoura::daemon::CycleAction::Evict { .. })));
@@ -260,7 +262,7 @@ fn daemon_cycle_triggers_bounded_and_ledgers_each_removal() {
 
     // immediate second cycle: rate-limit holds (default 300s)
     let cfg2 = Config { low_watermark_gib: 1_000_000.0, until_free_gib: 2_000_000.0, ..cfg.clone() };
-    let rep2 = vassoura::daemon::run_cycle(&cfg2);
+    let rep2 = vassoura::daemon::run_cycle_sampling(&cfg2, normal_disk);
     assert!(rep2.rate_limited, "eviction seconds ago → rate-limited");
     assert_eq!(rep2.removed, 0);
     let ledger2 = std::fs::read_to_string(&cfg2.ledger).unwrap();
@@ -429,7 +431,10 @@ fn daemon_churn_guard_refuses_to_reevict_what_regenerated() {
         ..sandbox_cfg(root.clone(), home.clone())
     };
 
-    let rep1 = vassoura::daemon::run_cycle(&cfg);
+    let gib = 1024u64 * 1024 * 1024;
+    let normal_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 30 * gib };
+
+    let rep1 = vassoura::daemon::run_cycle_sampling(&cfg, normal_disk);
     assert_eq!(rep1.removed, 4, "first cycle takes everything eligible");
     assert!(!rep1.backoff);
 
@@ -441,7 +446,7 @@ fn daemon_churn_guard_refuses_to_reevict_what_regenerated() {
         age_dir(p, 40);
     }
 
-    let rep2 = vassoura::daemon::run_cycle(&cfg);
+    let rep2 = vassoura::daemon::run_cycle_sampling(&cfg, normal_disk);
     assert_eq!(rep2.removed, 0, "the regenerated directory is churn-guarded");
     assert!(root.join("velho1/node_modules").exists(), "it stays put");
     let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
@@ -814,3 +819,73 @@ fn tools_missing_binary_fail_closed_and_reported() {
     assert!(outs.is_empty(), "Missing runs nothing");
     assert!(!cfg.ledger.exists());
 }
+
+#[test]
+fn daemon_emergency_evicts_completed_builds_older_than_ten_minutes_while_protecting_inflight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+
+    // 1. Build completed 25 minutes ago (1500s > 600s emergency floor, but < 3600s normal 1h floor)
+    let p_completed = root.join("terminado");
+    mkfile(&p_completed.join("Cargo.toml"), 20);
+    mkfile(&p_completed.join("target/debug/app"), 1000);
+    for p in [
+        &p_completed.join("target/debug/app"),
+        &p_completed.join("target/debug"),
+        &p_completed.join("target"),
+        &p_completed,
+    ] {
+        let t = filetime::FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_secs(1500));
+        filetime::set_file_times(p, t, t).unwrap();
+    }
+
+    // 2. Build in flight (created 1 minute ago, 60s < 600s emergency floor)
+    let p_inflight = root.join("construindo");
+    mkfile(&p_inflight.join("Cargo.toml"), 20);
+    mkfile(&p_inflight.join("target/debug/app"), 1000);
+    for p in [
+        &p_inflight.join("target/debug/app"),
+        &p_inflight.join("target/debug"),
+        &p_inflight.join("target"),
+        &p_inflight,
+    ] {
+        let t = filetime::FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_secs(60));
+        filetime::set_file_times(p, t, t).unwrap();
+    }
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 10,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let gib = 1024u64 * 1024 * 1024;
+    // Normal tight disk (30 GiB free out of 200 GiB = 85% used, < 95%):
+    // normal 1-hour floor rejects BOTH because 25m < 1h.
+    let normal_tight_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 30 * gib };
+    let rep_normal = vassoura::daemon::run_cycle_sampling(&cfg, normal_tight_disk);
+    assert_eq!(rep_normal.removed, 0, "normal tight mode rejects 25m target (< 1h floor)");
+    assert!(p_completed.join("target").exists());
+    assert!(p_inflight.join("target").exists());
+
+    // Emergency disk (< 15 GiB free / >= 95% used, e.g. 5 GiB free):
+    // emergency floor (10m) evicts the 25m completed build, while STILL protecting the 1m in-flight build!
+    let emergency_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 5 * gib };
+    let rep_emerg = vassoura::daemon::run_cycle_sampling_opts(
+        &cfg,
+        emergency_disk,
+        true, // force / emergency cycle
+        vassoura::daemon::ScanMode::Full,
+    );
+    assert_eq!(rep_emerg.removed, 1, "emergency mode evicts 25m completed build but protects in-flight");
+    assert!(!p_completed.join("target").exists(), "completed build was evicted");
+    assert!(p_inflight.join("target").exists(), "in-flight build remained strictly protected");
+}
+

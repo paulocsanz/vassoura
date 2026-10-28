@@ -21,6 +21,10 @@ Watermarked build-artifact collector (Rust CLI + daemon).
    (mtime diverged from the scan → skip). The tight-mode minimum has a hard
    1h floor (`MIN_AGE_FLOOR_DAYS`) — no config value, tight disk included,
    ever makes an in-flight build evictable.
+   Emergency exception (2026-10-28 incident): on critical disk usage (>= 98% / forced cycle / emergency floor),
+   the minimum age floor for pure regenerable artifacts (`Class::Artifact`) drops to 10 minutes (`EMERGENCY_MIN_AGE_FLOOR_DAYS`).
+   In-flight builds remain strictly protected by `lsof` gating and re-stat mtime checks, while finished builds older than 10 minutes
+   become collectible to prevent ENOSPC host lockup. Worktrees never drop below the hard 1h floor (`MIN_AGE_FLOOR_DAYS`).
 5. **no-churn** (2026-09 incident, 2026-10 emergency fix): the daemon never re-evicts a path
    removed in the last 7 days (`CHURN_GUARD_DAYS`), and when consecutive
    eviction cycles buy no durable free space the churn breaker suspends

@@ -200,15 +200,22 @@ fn default_min_age_days_worktrees() -> u64 {
     14
 }
 
-/// Absolute floor for ANY minimum age — tight mode and `--older-than`
-/// included. Nothing younger than 1 hour is ever evicted automatically.
+/// Absolute floor for ANY minimum age in normal operation — tight mode and `--older-than`
+/// included. Nothing younger than 1 hour is ever evicted automatically in normal mode.
 /// Incident 2026-09: `min_age_days_tight = 0` let the daemon delete
 /// minutes-old `dist/`/`node_modules` while the builds that wrote them were
 /// still running; the agents rebuilt, the daemon re-deleted, and the FSEvents
-/// storm took fseventsd to 84 GiB RSS. A full disk is no excuse to harvest
-/// an in-flight build: when eviction can't help, the churn breaker reports
-/// "target unreachable" instead.
+/// storm took fseventsd to 84 GiB RSS.
 pub const MIN_AGE_FLOOR_DAYS: f64 = 1.0 / 24.0;
+
+/// Emergency minimum age floor (10 minutes) for regenerable build artifacts (`Class::Artifact`).
+/// In extreme disk pressure (>= 95% full or < 15 GiB free), completed builds older than
+/// 10 minutes (with no open files and unchanged mtime) become evictable to prevent the
+/// machine from hitting ENOSPC and locking up. Worktrees and in-flight builds remain protected.
+pub const EMERGENCY_MIN_AGE_FLOOR_DAYS: f64 = 10.0 / 1440.0;
+
+/// Free-space floor in GiB below which the machine is in an emergency state regardless of disk size.
+pub const EMERGENCY_FREE_GIB_FLOOR: f64 = 15.0;
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
@@ -274,21 +281,47 @@ impl Config {
         self.min_age_days_tight.max(MIN_AGE_FLOOR_DAYS)
     }
 
+    /// Minimum age in days for a candidate of `class`, with emergency awareness.
+    /// In emergency mode (OS survival / disk critical), regenerable build artifacts
+    /// drop to `EMERGENCY_MIN_AGE_FLOOR_DAYS` (10 minutes).
+    /// Worktrees NEVER drop below `MIN_AGE_FLOOR_DAYS` (1 hour) / worktree default.
+    pub fn min_age_days_for_emergency(
+        &self,
+        class: crate::walk::Class,
+        override_min: Option<f64>,
+        emergency: bool,
+    ) -> f64 {
+        let floor = if emergency && class == crate::walk::Class::Artifact {
+            EMERGENCY_MIN_AGE_FLOOR_DAYS
+        } else {
+            MIN_AGE_FLOOR_DAYS
+        };
+        let min = match (emergency, class) {
+            (true, crate::walk::Class::Worktree) => self.min_age_days_worktrees as f64,
+            _ => override_min.unwrap_or(match class {
+                crate::walk::Class::Artifact => self.min_age_days_artifacts as f64,
+                crate::walk::Class::AppCache => self.min_age_days_app_caches as f64,
+                crate::walk::Class::Worktree => self.min_age_days_worktrees as f64,
+            }),
+        };
+        min.max(floor)
+    }
+
     /// Minimum age in days for a candidate of `class`. `override_min` (tight
     /// mode / `--older-than`) replaces the class default but NOTHING goes
     /// below `MIN_AGE_FLOOR_DAYS` — the "nothing-in-use" invariant is not
     /// configurable away.
     pub fn min_age_days_for(&self, class: crate::walk::Class, override_min: Option<f64>) -> f64 {
-        let min = override_min.unwrap_or(match class {
-            crate::walk::Class::Artifact => self.min_age_days_artifacts as f64,
-            crate::walk::Class::AppCache => self.min_age_days_app_caches as f64,
-            crate::walk::Class::Worktree => self.min_age_days_worktrees as f64,
-        });
-        min.max(MIN_AGE_FLOOR_DAYS)
+        self.min_age_days_for_emergency(class, override_min, false)
     }
 
-    /// Explicit per-root age override (longest matching expanded prefix).
-    pub fn age_override_for(&self, path: &Path) -> Option<f64> {
+    /// Explicit per-root age override (longest matching expanded prefix), with emergency floor.
+    pub fn age_override_for_emergency(&self, path: &Path, emergency: bool) -> Option<f64> {
+        let floor = if emergency {
+            EMERGENCY_MIN_AGE_FLOOR_DAYS
+        } else {
+            MIN_AGE_FLOOR_DAYS
+        };
         let mut best: Option<(usize, f64)> = None;
         for (root, days) in &self.age_overrides {
             let root = expand(Path::new(root));
@@ -299,7 +332,12 @@ impl Config {
                 }
             }
         }
-        best.map(|(_, d)| d.max(MIN_AGE_FLOOR_DAYS))
+        best.map(|(_, d)| d.max(floor))
+    }
+
+    /// Explicit per-root age override (longest matching expanded prefix).
+    pub fn age_override_for(&self, path: &Path) -> Option<f64> {
+        self.age_override_for_emergency(path, false)
     }
 }
 
@@ -463,5 +501,19 @@ artifact_names = ["node_modules"]
         cfg.min_age_days_tight = 0.0;
         assert_eq!(cfg.tight_min_age(), MIN_AGE_FLOOR_DAYS);
         assert_eq!(MIN_AGE_FLOOR_DAYS, 1.0 / 24.0, "floor is one hour");
+    }
+
+    #[test]
+    fn emergency_min_age_floor_protects_worktrees_and_drops_artifacts() {
+        let cfg = Config::default();
+        // In normal mode: floor is MIN_AGE_FLOOR_DAYS (1h)
+        assert_eq!(cfg.min_age_days_for_emergency(crate::walk::Class::Artifact, Some(0.0), false), MIN_AGE_FLOOR_DAYS);
+        assert_eq!(cfg.min_age_days_for_emergency(crate::walk::Class::Worktree, Some(0.0), false), MIN_AGE_FLOOR_DAYS);
+
+        // In emergency mode:
+        // Artifact drops to EMERGENCY_MIN_AGE_FLOOR_DAYS (10m)
+        assert_eq!(cfg.min_age_days_for_emergency(crate::walk::Class::Artifact, Some(0.0), true), EMERGENCY_MIN_AGE_FLOOR_DAYS);
+        // Worktree NEVER drops below MIN_AGE_FLOOR_DAYS / worktree default
+        assert!(cfg.min_age_days_for_emergency(crate::walk::Class::Worktree, Some(0.0), true) >= MIN_AGE_FLOOR_DAYS);
     }
 }

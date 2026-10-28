@@ -33,6 +33,16 @@ pub fn build(
     build_inner(cands, cfg, override_min, None, false)
 }
 
+/// Split out the eligible ones with emergency mode awareness (e.g. CLI clean on critical disk).
+pub fn build_emergency(
+    cands: Vec<Candidate>,
+    cfg: &Config,
+    override_min: Option<f64>,
+    emergency: bool,
+) -> (Vec<PlanItem>, Vec<Rejected>) {
+    build_inner(cands, cfg, override_min, None, emergency)
+}
+
 /// The daemon path: `build` with LRU by last-seen (seen.db, P2.1) and the
 /// CHURN GUARD — a path evicted less than `CHURN_GUARD_DAYS` ago stays out of
 /// the plan: whatever regenerated it is alive and will keep regenerating it
@@ -94,7 +104,7 @@ fn build_inner(
         }
         // an explicit per-root age override marks a temp zone: it regenerates
         // by the GB per hour and re-deleting it harms nobody — 1 day of guard
-        let root_override = cfg.age_override_for(&c.path);
+        let root_override = cfg.age_override_for_emergency(&c.path, emergency);
         let churn_days = if root_override.is_some() { 1.0 } else { CHURN_GUARD_DAYS };
         if let Some(seen) = seen {
             if !emergency {
@@ -116,10 +126,10 @@ fn build_inner(
             }
         }
         // explicit root override lowers the class minimum (tight mode keeps
-        // winning when critical: the 1h absolute floor is in min_age_days_for)
+        // winning when critical; in emergency, regenerable artifacts use EMERGENCY_MIN_AGE_FLOOR_DAYS)
         let min = match root_override {
-            Some(o) => o.min(cfg.min_age_days_for(c.class, override_min)),
-            None => cfg.min_age_days_for(c.class, override_min),
+            Some(o) => o.min(cfg.min_age_days_for_emergency(c.class, override_min, emergency)),
+            None => cfg.min_age_days_for_emergency(c.class, override_min, emergency),
         };
         let age = age_days(now, c.newest_mtime);
         if age < min {
