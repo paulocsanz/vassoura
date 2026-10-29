@@ -287,6 +287,21 @@ pub(crate) fn is_artifact_candidate_dir(path: &Path, names: &HashSet<&str>) -> b
 /// (root permissions) and catastrophic. Furthermore, macOS daemons write to `T` and `C`
 /// continuously, so the bucket directory is always 0 seconds old and in use.
 ///
+#[cfg(unix)]
+pub(crate) fn is_writable_dir(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+    } else {
+        false
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_writable_dir(_path: &Path) -> bool {
+    true
+}
+
 /// The actual regenerable build dust and test artifacts (e.g. Playwright, cargo test,
 /// browser caches) sit as individual directories inside `T`, `C`, `X`, and `0` (depth 4
 /// from `var/folders`).
@@ -401,6 +416,9 @@ pub(crate) fn enumerate_app_cache_candidates(
         };
 
         if rel_depth >= 4 {
+            if !is_writable_dir(scan_from) {
+                return candidates;
+            }
             if let Ok(meta) = fs::symlink_metadata(scan_from) {
                 if meta.is_dir() && !meta.is_symlink() {
                     if expand_nested_cache_leaves(scan_from, &mut candidates) {
@@ -423,10 +441,16 @@ pub(crate) fn enumerate_app_cache_candidates(
         for _ in 1..remaining_levels {
             let mut next_dirs = Vec::new();
             for dir in current_dirs {
+                if !is_writable_dir(&dir) {
+                    continue;
+                }
                 if let Ok(rd) = fs::read_dir(dir) {
                     for entry in rd.flatten() {
                         if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
-                            next_dirs.push(entry.path());
+                            let p = entry.path();
+                            if is_writable_dir(&p) {
+                                next_dirs.push(p);
+                            }
                         }
                     }
                 }
@@ -435,10 +459,16 @@ pub(crate) fn enumerate_app_cache_candidates(
         }
 
         for dir in current_dirs {
+            if !is_writable_dir(&dir) {
+                continue;
+            }
             if let Ok(rd) = fs::read_dir(dir) {
                 for entry in rd.flatten() {
                     if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
                         let path = entry.path();
+                        if !is_writable_dir(&path) {
+                            continue;
+                        }
                         if expand_nested_cache_leaves(&path, &mut candidates) {
                             continue;
                         }
@@ -459,6 +489,9 @@ pub(crate) fn enumerate_app_cache_candidates(
         for entry in rd.flatten() {
             if entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
                 let path = entry.path();
+                if !is_writable_dir(&path) {
+                    continue;
+                }
                 if expand_nested_cache_leaves(&path, &mut candidates) {
                     continue;
                 }

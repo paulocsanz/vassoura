@@ -424,6 +424,7 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         std::fs::write(tmp.path().join("package.json"), b"{}").unwrap();
         assert!(
             matches!(git_state(&cand), UseState::InUse(_)),
@@ -460,6 +461,7 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         std::fs::write(tmp.path().join("Cargo.toml"), b"[package]").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);
@@ -492,6 +494,7 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("Cargo.toml"), b"[workspace]").unwrap();
         std::fs::write(pkg_a.join("Cargo.toml"), b"[package]").unwrap();
         std::fs::write(pkg_b.join("Cargo.toml"), b"[package]").unwrap();
@@ -540,6 +543,7 @@ mod tests {
         git_repo(&["init", "-q"]);
         git_repo(&["config", "user.email", "t@t"]);
         git_repo(&["config", "user.name", "t"]);
+        git_repo(&["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("README.md"), b"hi").unwrap();
         git_repo(&["add", "."]);
         git_repo(&["commit", "-qm", "init"]);
@@ -577,6 +581,7 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("Cargo.toml"), b"[package]").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);

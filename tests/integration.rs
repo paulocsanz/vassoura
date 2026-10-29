@@ -177,6 +177,7 @@ fn clean_skips_dirty_worktree_but_clean_worktree_is_eligible() {
     git(&project, &["init", "-q"]);
     git(&project, &["config", "user.email", "t@t"]);
     git(&project, &["config", "user.name", "t"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
     std::fs::write(project.join(".gitignore"), "node_modules\n").unwrap();
     git(&project, &["add", ".gitignore", "package.json"]);
     git(&project, &["commit", "-qm", "init"]);

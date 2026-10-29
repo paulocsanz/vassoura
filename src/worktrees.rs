@@ -304,6 +304,7 @@ mod tests {
         run(&["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()], tmp.path());
         run(&["config", "user.email", "t@t"], &clone);
         run(&["config", "user.name", "t"], &clone);
+        run(&["config", "commit.gpgsign", "false"], &clone);
         std::fs::write(clone.join("f.txt"), b"one").unwrap();
         run(&["add", "."], &clone);
         run(&["commit", "-qm", "one"], &clone);
@@ -363,6 +364,7 @@ mod tests {
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "t@t"]);
         run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
         std::fs::write(tmp.path().join("a"), b"a").unwrap();
         run(&["add", "."]);
         run(&["commit", "-qm", "a"]);
