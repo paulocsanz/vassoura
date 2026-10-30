@@ -62,12 +62,23 @@ Watermarked build-artifact collector (Rust CLI + daemon).
    promote shallow artifacts down to depth 3 to `ScanJob::Measure` immediately.
    This ensures multi-gigabyte subproject build artifacts run in the first 500ms
    of the scan rather than starving behind thousands of app cache items in `Hunt`.
-11. **transient-search-and-virtiofs-gate-isolation** (2026-10 incident): transient
-   read-only searches (`grep`, `rg`, `find`, `mdworker`) and Linux guest VFS
-   inode caches via Apple Virtualization framework / VirtioFS (`com.apple.Virtualization.*`)
-   are isolated from active host compiler/build processes. Read-only search tools
-   never block artifact eviction, and in emergency disk pressure (>= 98% / forced cycle),
-   idle VirtioFS guest handles do not block regenerable artifact eviction.
+11. **transient-search-watcher-and-virtiofs-gate-isolation** (2026-10 incident): transient
+   read-only searches/scanners (`grep`, `rg`, `find`, `bfs`, `fd`, `du`, `ncdu`, `dust`,
+   `tree`, `ls`, `eza`, `mdworker`, `watchman`), passive directory descriptors (`lsof`
+   `type=DIR` where `fd != cwd` and `fd != rtd`, such as `claude`/IDE `O_EVTONLY` `kqueue`
+   file-system watches), and Linux guest VFS inode caches via Apple Virtualization
+   framework / VirtioFS (`com.apple.Virtualization.*`) are isolated from active host
+   compiler/build processes. Read-only search tools and passive directory watches never
+   block artifact eviction (`cwd`/`rtd` and open `REG`/`txt` files/locks always block),
+   and in emergency disk pressure (>= 98% / forced cycle), idle VirtioFS guest handles
+   do not block regenerable artifact eviction.
+12. **pinned-cargo-target-intermediate-salvage** (2026-10-30 incident): when a Cargo
+   `target/` directory is skipped because a long-running service binary (`target/<profile>/<bin>`)
+   is executing or one profile is young while others are cold, and no active Cargo build lock
+   (`.cargo-lock` / `.cargo-build-lock`) is open in `lsof`, pure intermediate subtrees
+   (`<profile>/{deps, incremental, build}` and unpinned cross-target `<triple>` directories)
+   are salvaged as independent `Class::Artifact` candidates subject to full age, `lsof`,
+   re-stat `mtime`, and ledger invariants — never touching top-level linked binaries.
 
 ## Working rules
 

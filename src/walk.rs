@@ -117,14 +117,15 @@ pub fn scan_with_health(
 
 /// Probe budget: a shallow measurement is a lower bound on size, good
 /// enough to rank the biggest targets — the 80/20 with ~1% of the IO of a
-/// full walk. 400 entries / 250ms per candidate.
+/// full walk. 4_000 entries / 250ms per candidate (combined with `deps`/`.pnpm`
+/// queue priority in `measure_inner` so `.fingerprint` dirs never starve `deps`).
 pub(crate) fn measure_probe(path: &Path, class: Class) -> Candidate {
     let mut prog = Progress::new(true);
     let mut c = measure_inner(
         path,
         class,
         &mut prog,
-        400,
+        4_000,
         std::time::Duration::from_millis(250),
         &mut |_| {},
     );
@@ -139,11 +140,22 @@ pub(crate) fn measure_probe(path: &Path, class: Class) -> Candidate {
 /// `list_jobs` already knows that shape, so this runs its jobs with probe
 /// budgets instead of full hunts. Seconds where the full scan dies.
 pub fn scan_probe(cfg: &Config, root_filter: Option<&Path>) -> Vec<Candidate> {
+    scan_probe_missing(cfg, root_filter, &HashSet::new())
+}
+
+/// Probe only candidates not already present in `already_measured`.
+pub fn scan_probe_missing(
+    cfg: &Config,
+    root_filter: Option<&Path>,
+    already_measured: &HashSet<PathBuf>,
+) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
     for job in list_jobs(cfg, root_filter) {
         match job {
             ScanJob::Measure { path, class } => {
-                out.push(measure_probe(&path, class));
+                if !already_measured.contains(&path) {
+                    out.push(measure_probe(&path, class));
+                }
             }
             ScanJob::Hunt(dir) => {
                 // one level only: regenerable-named children, nothing deeper
@@ -155,7 +167,10 @@ pub fn scan_probe(cfg: &Config, root_filter: Option<&Path>) -> Vec<Candidate> {
                     }
                     let name = entry.file_name();
                     if cfg.artifact_names.iter().any(|n| n == &name.to_string_lossy()) {
-                        out.push(measure_probe(&entry.path(), Class::Artifact));
+                        let p = entry.path();
+                        if !already_measured.contains(&p) {
+                            out.push(measure_probe(&p, Class::Artifact));
+                        }
                     }
                 }
             }
@@ -274,6 +289,110 @@ pub(crate) fn is_artifact_candidate_dir(path: &Path, names: &HashSet<&str>) -> b
         return true;
     }
     false
+}
+
+/// True when `path` is a Cargo `target` directory (by name or `.rustc_info.json`)
+/// containing Cargo profile subdirectories.
+pub fn is_cargo_target_dir(path: &Path) -> bool {
+    let Ok(md) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !md.is_dir() || md.is_symlink() || !is_writable_dir(path) {
+        return false;
+    }
+    let has_rustc_info = path.join(".rustc_info.json").exists();
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name_matches = name == "target"
+        || name.ends_with("-target")
+        || name.ends_with("_target")
+        || name.starts_with("target-")
+        || name.starts_with("target_")
+        || name.starts_with("cargo-")
+        || name.starts_with("cargo_")
+        || has_rustc_info;
+    if !name_matches {
+        return false;
+    }
+    has_rustc_info || path.join("debug").is_dir() || path.join("release").is_dir()
+}
+
+pub fn is_cargo_target_candidate(cand: &Candidate) -> bool {
+    cand.class == Class::Artifact && !cand.contains_git && is_cargo_target_dir(&cand.path)
+}
+
+fn push_cargo_profile_intermediates(
+    profile_dir: &Path,
+    prog: &mut Progress,
+    out: &mut Vec<Candidate>,
+) {
+    for sub_name in ["deps", "incremental", "build"] {
+        let sub = profile_dir.join(sub_name);
+        let Ok(md) = fs::symlink_metadata(&sub) else {
+            continue;
+        };
+        if md.is_dir() && !md.is_symlink() && is_writable_dir(&sub) {
+            out.push(measure_budgeted(&sub, Class::Artifact, prog, &mut |_| {}));
+        }
+    }
+}
+
+/// Decompose a pinned or mixed-age Cargo `target/` directory into its pure
+/// intermediate compilation subtrees (`<profile>/{deps, incremental, build}`
+/// and cross-compilation `<triple>` directories), leaving top-level linked
+/// binaries (`target/debug/<daemon>`, `target/release/<daemon>`) untouched.
+pub fn salvage_cargo_target_subcandidates(
+    cfg: &Config,
+    target_dir: &Path,
+    is_pinned: &dyn Fn(&Path) -> bool,
+) -> Vec<Candidate> {
+    if !is_cargo_target_dir(target_dir) {
+        return Vec::new();
+    }
+    let Ok(rd) = fs::read_dir(target_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut prog = Progress::new(true);
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+        let child = entry.path();
+        if !is_writable_dir(&child) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if PRUNE_DIRS.contains(&name.as_str()) || name.starts_with('.') {
+            continue;
+        }
+        let is_profile = name == "debug"
+            || name == "release"
+            || (child.join("deps").is_dir() && child.join(".fingerprint").is_dir());
+        if is_profile {
+            push_cargo_profile_intermediates(&child, &mut prog, &mut out);
+            continue;
+        }
+        // Cross-compilation target-triple directory (e.g. aarch64-unknown-linux-musl, wasm32-unknown-unknown)
+        let has_nested_profile = child.join("debug").is_dir() || child.join("release").is_dir();
+        if name.contains('-') && has_nested_profile {
+            if !is_pinned(&child) {
+                out.push(measure_budgeted(&child, Class::Artifact, &mut prog, &mut |_| {}));
+            } else {
+                for nested in ["debug", "release"] {
+                    let np = child.join(nested);
+                    if np.is_dir() {
+                        push_cargo_profile_intermediates(&np, &mut prog, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    accept(cfg, out)
 }
 
 /// Helper to identify if a path is part of a Darwin `var/folders` structure.
@@ -536,8 +655,10 @@ pub(crate) enum ScanJob {
 pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob> {
     let names: HashSet<&str> = cfg.artifact_names.iter().map(|s| s.as_str()).collect();
     let prune: HashSet<&str> = PRUNE_DIRS.iter().copied().collect();
+    let mut artifact_measure_jobs = Vec::new();
+    let mut cache_measure_jobs = Vec::new();
+    let mut worktree_measure_jobs = Vec::new();
     let mut hunt_jobs = Vec::new();
-    let mut measure_jobs = Vec::new();
 
     for root in &cfg.artifact_roots {
         let root = expand(root);
@@ -552,7 +673,7 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
         };
         for job in split_root(&scan_from, &names, &prune) {
             match job {
-                ScanJob::Measure { .. } => measure_jobs.push(job),
+                ScanJob::Measure { .. } => artifact_measure_jobs.push(job),
                 ScanJob::Hunt(..) => hunt_jobs.push(job),
             }
         }
@@ -569,7 +690,10 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
             None => root.clone(),
         };
         for (path, class) in enumerate_app_cache_candidates(&root, &scan_from, &names) {
-            measure_jobs.push(ScanJob::Measure { path, class });
+            match class {
+                Class::Artifact => artifact_measure_jobs.push(ScanJob::Measure { path, class }),
+                _ => cache_measure_jobs.push(ScanJob::Measure { path, class }),
+            }
         }
     }
     for repo in &cfg.worktree_repos {
@@ -609,16 +733,22 @@ pub(crate) fn list_jobs(cfg: &Config, root_filter: Option<&Path>) -> Vec<ScanJob
 
             for wt in candidate_wts {
                 if merged_heads.contains(&wt.head) {
-                    measure_jobs.push(ScanJob::Measure { path: wt.path, class: Class::Worktree });
+                    worktree_measure_jobs.push(ScanJob::Measure { path: wt.path, class: Class::Worktree });
                 }
             }
         }
     }
 
-    // Measure jobs (single-directory caches, /tmp targets, worktrees) complete in milliseconds.
-    // Putting them first ensures they are never starved by deep recursive Hunt jobs when a cycle deadline hits.
-    measure_jobs.extend(hunt_jobs);
-    measure_jobs
+    // Priority order under cycle deadlines:
+    // 1. Artifact Measure jobs (`target`, `node_modules`, `/tmp/*-target`): multi-GiB yield, 10m emergency floor
+    // 2. AppCache Measure jobs (`~/Library/Caches/*`, `/var/folders` leaves)
+    // 3. Worktree Measure jobs (40k-entry source checkouts, 14-day min age)
+    // 4. Deep recursive Hunt jobs (rotated each critical cycle)
+    let mut jobs = artifact_measure_jobs;
+    jobs.extend(cache_measure_jobs);
+    jobs.extend(worktree_measure_jobs);
+    jobs.extend(hunt_jobs);
+    jobs
 }
 
 fn has_sub_projects_or_repos(dir: &Path) -> bool {
@@ -854,11 +984,16 @@ fn measure_inner(
                 continue;
             }
             if ft.is_dir() {
-                if entry.file_name() == ".git" {
+                let dname = entry.file_name();
+                if dname == ".git" {
                     contains_git = true;
                     continue;
                 }
-                queue.push_back(entry.path());
+                if matches!(dname.to_str(), Some("deps" | "debug" | "release" | ".pnpm")) {
+                    queue.push_front(entry.path());
+                } else {
+                    queue.push_back(entry.path());
+                }
                 continue;
             }
             bytes += md.len();
@@ -1215,5 +1350,86 @@ mod tests {
 
         assert!(measure_paths.contains(&target), "target inside monorepo subproject must be promoted to Measure job");
     }
-}
 
+    #[test]
+    fn measure_probe_sees_cargo_deps_bytes_despite_hundreds_of_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        // 600 tiny `.fingerprint` directories (alphabetically ahead of `deps` on APFS!)
+        for i in 0..600 {
+            let fp = target.join(format!("debug/.fingerprint/crate-{i:04}/invoked.timestamp"));
+            fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            fs::write(&fp, b"ts").unwrap();
+        }
+        // Multi-megabyte rlib inside `debug/deps`
+        let rlib = target.join("debug/deps/libbig.rlib");
+        fs::create_dir_all(rlib.parent().unwrap()).unwrap();
+        fs::write(&rlib, vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+        let probed = measure_probe(&target, Class::Artifact);
+        assert!(
+            probed.bytes >= 2 * 1024 * 1024,
+            "probe must reach debug/deps without starving in .fingerprint, got {} B",
+            probed.bytes
+        );
+    }
+
+    #[test]
+    fn salvage_cargo_target_extracts_intermediates_and_preserves_running_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("software");
+        let target = root.join("caixote/target");
+        mk(&target.join("debug/caixote-api"), 500, 10);
+        mk(&target.join("debug/deps/libheavy.rlib"), 10_000, 10);
+        mk(&target.join("debug/incremental/s1/part.o"), 4_000, 10);
+        mk(&target.join("debug/build/serde-123/out"), 2_000, 10);
+        mk(&target.join("aarch64-unknown-linux-musl/release/deps/libmusl.rlib"), 8_000, 10);
+
+        let cfg = Config {
+            artifact_roots: vec![root],
+            app_cache_roots: vec![],
+            worktree_repos: vec![],
+            ..Config::default()
+        };
+
+        let sub = salvage_cargo_target_subcandidates(&cfg, &target, &|p| {
+            p == target.join("debug")
+        });
+        let paths: HashSet<PathBuf> = sub.iter().map(|c| c.path.clone()).collect();
+        assert!(paths.contains(&target.join("debug/deps")), "{paths:?}");
+        assert!(paths.contains(&target.join("debug/incremental")), "{paths:?}");
+        assert!(paths.contains(&target.join("debug/build")), "{paths:?}");
+        assert!(paths.contains(&target.join("aarch64-unknown-linux-musl")), "{paths:?}");
+        assert!(
+            !paths.contains(&target.join("debug/caixote-api"))
+                && !paths.contains(&target.join("debug")),
+            "running daemon binary in target/debug must NEVER be included in salvage: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn list_jobs_orders_artifact_measures_ahead_of_app_cache_measures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sw = tmp.path().join("software");
+        let caches = tmp.path().join("Caches");
+        fs::create_dir_all(sw.join("proj/target")).unwrap();
+        fs::create_dir_all(caches.join("com.apple.Safari")).unwrap();
+
+        let cfg = Config {
+            artifact_roots: vec![sw.clone()],
+            app_cache_roots: vec![caches.clone()],
+            worktree_repos: vec![],
+            ..Config::default()
+        };
+        let jobs = list_jobs(&cfg, None);
+        let first_artifact = jobs
+            .iter()
+            .position(|j| matches!(j, ScanJob::Measure { class: Class::Artifact, .. }))
+            .expect("artifact measure job");
+        let first_cache = jobs
+            .iter()
+            .position(|j| matches!(j, ScanJob::Measure { class: Class::AppCache, .. }))
+            .expect("cache measure job");
+        assert!(first_artifact < first_cache, "Artifact Measure jobs must precede AppCache Measure jobs");
+    }
+}

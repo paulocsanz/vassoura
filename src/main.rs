@@ -69,7 +69,7 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// Tool classes (ollama/docker/rustup/pnpm/go) — dry-run by default
+    /// Tool classes (ollama/docker/rustup/elan/pnpm/go) — dry-run by default
     Tools {
         /// Actually run each tool's own CLI
         #[arg(long)]
@@ -356,7 +356,39 @@ fn cmd_clean(
         }
     }
 
-    let out = clean::apply_policy(&packed.items, &config::expand(&cfg.ledger), is_critical);
+    let mut out = clean::apply_policy(&packed.items, &config::expand(&cfg.ledger), is_critical);
+    let skipped_cargo_targets: Vec<PathBuf> = out
+        .skipped
+        .iter()
+        .filter(|(p, why)| why.starts_with("in use:") && walk::is_cargo_target_dir(p))
+        .map(|(p, _)| p.clone())
+        .collect();
+    if !skipped_cargo_targets.is_empty() {
+        let target_refs: Vec<&Path> = skipped_cargo_targets.iter().map(|p| p.as_path()).collect();
+        let mut gates = vassoura::gates::prepare(&target_refs);
+        let (salvaged, salvaged_skipped) = daemon::salvage_pinned_cargo_targets(
+            &skipped_cargo_targets,
+            cfg,
+            effective_older_than,
+            None,
+            &mut gates,
+            is_emergency,
+            std::time::SystemTime::now(),
+        );
+        if !salvaged.is_empty() {
+            let after_first = disk_of(cfg);
+            let sub_packed = plan::pack(salvaged, after_first.free, until, top);
+            let sub_out = clean::apply_with(
+                &sub_packed.items,
+                &config::expand(&cfg.ledger),
+                &|cand| gates.check_candidate(cand, is_emergency),
+            );
+            out.removed += sub_out.removed;
+            out.freed += sub_out.freed;
+            out.skipped.extend(sub_out.skipped);
+        }
+        out.skipped.extend(salvaged_skipped);
+    }
     let after = disk_of(cfg);
     println!(
         "\nremoved: {} dirs · freed: {} · free now: {} (was {})",
@@ -467,13 +499,14 @@ fn print_cycle(cfg: &config::Config, rep: &daemon::CycleReport) {
         }
     };
     println!(
-        "cycle: {} candidates · eligible {} · free {} → {} · {}{}{}{}",
+        "cycle: {} candidates · eligible {} · free {} → {} · {}{}{}{}{}",
         rep.scanned,
         human(rep.eligible_bytes),
         human(rep.free_before),
         human(rep.free_after),
         action,
         if rep.degraded { " [DEGRADED: shallow probe scan]" } else { "" },
+        if rep.deadline_truncated && !rep.degraded { " [deadline: deep hunt capped + probe]" } else { "" },
         if rep.rate_limited { " [rate-limited: holding this cycle]" } else { "" },
         if rep.backoff { " [BACKOFF: churn breaker holding evictions]" } else { "" }
     );

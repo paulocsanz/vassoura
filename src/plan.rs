@@ -178,6 +178,21 @@ pub struct Packed {
 /// 400 items, 5.2 GiB in the plan, 55 MiB actually freed, disk still full.
 const SLOT_FLOOR: u64 = 64 * 1024 * 1024;
 
+/// Sort eligible items into exact eviction priority order:
+/// 1. Substantial candidates (`>= SLOT_FLOOR`, 64 MiB) come ahead of small dust,
+///    so bounded gate windows and item caps never starve GiB-scale targets behind `__pycache__`.
+/// 2. Within each tier, oldest `last_used` first (LRU), breaking ties by largest `bytes`.
+pub fn sort_eviction_order(items: &mut [PlanItem]) {
+    items.sort_by(|a, b| {
+        let a_dust = a.cand.bytes < SLOT_FLOOR;
+        let b_dust = b.cand.bytes < SLOT_FLOOR;
+        a_dust
+            .cmp(&b_dust)
+            .then_with(|| a.last_used.cmp(&b.last_used))
+            .then_with(|| b.cand.bytes.cmp(&a.cand.bytes))
+    });
+}
+
 /// Pack eligible items in LRU order (least recently used first) until the
 /// free-space target, the `top` item cap, or the per-cycle byte cap.
 /// Items ≥ `SLOT_FLOOR` go in first; dust only takes a slot afterwards.
@@ -193,25 +208,12 @@ pub fn pack_capped(
     top: usize,
     cap_bytes: Option<u64>,
 ) -> Packed {
-    let by_lru = |a: &PlanItem, b: &PlanItem| {
-        a.last_used
-            .cmp(&b.last_used)
-            .then(b.cand.bytes.cmp(&a.cand.bytes))
-    };
-    items.sort_by(by_lru);
-    let (mut big, mut dust) = (Vec::new(), Vec::new());
-    for it in items {
-        if it.cand.bytes >= SLOT_FLOOR {
-            big.push(it);
-        } else {
-            dust.push(it);
-        }
-    }
+    sort_eviction_order(&mut items);
     let target = (until_free_gib * GIB as f64) as u64;
     let need = target.saturating_sub(free);
     let mut planned = 0u64;
     let mut out = Vec::new();
-    for it in big.into_iter().chain(dust) {
+    for it in items {
         if planned >= need || out.len() >= top {
             break;
         }
@@ -259,7 +261,7 @@ pub fn regen_hint(path: &Path) -> String {
     if has(parent, "package.json") {
         return "npm install".into();
     }
-    if has(parent, "Cargo.toml") {
+    if path.ancestors().skip(1).take(5).any(|a| has(a, "Cargo.toml")) {
         return "cargo build".into();
     }
     if has(parent, "Podfile") {
@@ -429,5 +431,29 @@ mod tests {
         assert!(rejected.iter().any(|r| r.path == Path::new("/home/x/plain/target")
             && r.reason.contains("churn guard")),
             "plain root keeps the 7d guard; {rejected:?}");
+    }
+
+    #[test]
+    fn sort_eviction_order_puts_large_targets_ahead_of_hundreds_of_dust_items() {
+        let mut items: Vec<PlanItem> = (0..200)
+            .map(|i| item(&format!("/x/dust-{i}/__pycache__"), 1024, 100))
+            .collect();
+        items.push(item("/x/caixote/target", 20 * GIB, 2));
+
+        sort_eviction_order(&mut items);
+        assert_eq!(
+            items[0].cand.path,
+            Path::new("/x/caixote/target"),
+            "GiB-scale target must come before tiny dust so check_window never truncates it"
+        );
+    }
+
+    #[test]
+    fn regen_hint_recognizes_nested_cargo_target_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("caixote");
+        std::fs::create_dir_all(proj.join("target/debug/deps")).unwrap();
+        std::fs::write(proj.join("Cargo.toml"), b"[package]\n").unwrap();
+        assert_eq!(regen_hint(&proj.join("target/debug/deps")), "cargo build");
     }
 }

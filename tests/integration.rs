@@ -742,6 +742,7 @@ fn tools_execute_via_cli_and_ledger_each_removal() {
         ledger: tmp.path().join("ledger.jsonl"),
         tools: vassoura::config::ToolsCfg {
             rustup: false,
+            elan: false,
             pnpm: false,
             go: false,
             ..vassoura::config::ToolsCfg::default()
@@ -796,6 +797,7 @@ fn tools_missing_binary_fail_closed_and_reported() {
         ledger: tmp.path().join("ledger.jsonl"),
         tools: vassoura::config::ToolsCfg {
             rustup: false,
+            elan: false,
             pnpm: false,
             go: false,
             ..vassoura::config::ToolsCfg::default()
@@ -889,4 +891,210 @@ fn daemon_emergency_evicts_completed_builds_older_than_ten_minutes_while_protect
     assert!(!p_completed.join("target").exists(), "completed build was evicted");
     assert!(p_inflight.join("target").exists(), "in-flight build remained strictly protected");
 }
+
+#[test]
+fn daemon_salvages_cargo_target_intermediates_when_daemon_binary_is_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    let proj = root.join("caixote");
+
+    mkfile(&proj.join("Cargo.toml"), 40);
+    let bin_path = proj.join("target/debug/caixote-api");
+    mkfile(&bin_path, 4096);
+    mkfile(&proj.join("target/debug/deps/libheavy.rlib"), 100_000);
+    mkfile(&proj.join("target/debug/incremental/sess/part.o"), 50_000);
+    mkfile(&proj.join("target/aarch64-unknown-linux-musl/release/deps/libmusl.rlib"), 80_000);
+
+    for p in [
+        &proj.join("target/debug/deps/libheavy.rlib"),
+        &proj.join("target/debug/deps"),
+        &proj.join("target/debug/incremental/sess/part.o"),
+        &proj.join("target/debug/incremental/sess"),
+        &proj.join("target/debug/incremental"),
+        &bin_path,
+        &proj.join("target/debug"),
+        &proj.join("target/aarch64-unknown-linux-musl/release/deps/libmusl.rlib"),
+        &proj.join("target/aarch64-unknown-linux-musl/release/deps"),
+        &proj.join("target/aarch64-unknown-linux-musl/release"),
+        &proj.join("target/aarch64-unknown-linux-musl"),
+        &proj.join("target"),
+        &proj,
+        &root,
+    ] {
+        age_dir(p, 10);
+    }
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 20,
+            rate_limit_secs: 0,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let mut hold = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "f=open({:?},'rb'); import time; time.sleep(25)",
+            bin_path.display().to_string()
+        ))
+        .spawn()
+        .expect("python3");
+    std::thread::sleep(Duration::from_millis(800));
+
+    let gib = 1024u64 * 1024 * 1024;
+    let tight_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 20 * gib };
+    let rep = vassoura::daemon::run_cycle_sampling(&cfg, tight_disk);
+
+    let _ = hold.kill();
+    let _ = hold.wait();
+
+    assert!(bin_path.exists(), "running top-level binary in target/debug MUST stay untouched");
+    assert!(!proj.join("target/debug/deps").exists(), "cold deps/ salvaged");
+    assert!(!proj.join("target/debug/incremental").exists(), "cold incremental/ salvaged");
+    assert!(
+        !proj.join("target/aarch64-unknown-linux-musl").exists(),
+        "cold cross-target salvaged"
+    );
+    assert_eq!(rep.removed, 3, "salvaged deps + incremental + cross-target: {:?}", rep.skipped);
+
+    let ledger = std::fs::read_to_string(&cfg.ledger).unwrap();
+    let lines: Vec<serde_json::Value> = ledger
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    for v in &lines {
+        assert_eq!(v["hint"], "cargo build", "salvaged target subdirs get cargo build hint: {v}");
+    }
+}
+
+#[test]
+fn daemon_refuses_cargo_target_salvage_when_cargo_lock_is_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+    let proj = root.join("ativo");
+
+    mkfile(&proj.join("Cargo.toml"), 40);
+    let bin_path = proj.join("target/debug/caixote-api");
+    let lock_path = proj.join("target/debug/.cargo-lock");
+    mkfile(&bin_path, 4096);
+    mkfile(&lock_path, 0);
+    mkfile(&proj.join("target/debug/deps/libheavy.rlib"), 100_000);
+
+    for p in [
+        &proj.join("target/debug/deps/libheavy.rlib"),
+        &proj.join("target/debug/deps"),
+        &bin_path,
+        &lock_path,
+        &proj.join("target/debug"),
+        &proj.join("target"),
+        &proj,
+        &root,
+    ] {
+        age_dir(p, 10);
+    }
+
+    let cfg = Config {
+        low_watermark_gib: 40.0,
+        until_free_gib: 100.0,
+        daemon: vassoura::config::DaemonCfg {
+            max_items_per_cycle: 20,
+            rate_limit_secs: 0,
+            notify: false,
+            ..vassoura::config::DaemonCfg::default()
+        },
+        ..sandbox_cfg(root.clone(), home.clone())
+    };
+
+    let mut hold = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "f1=open({:?},'rb'); f2=open({:?},'rb'); import time; time.sleep(25)",
+            bin_path.display().to_string(),
+            lock_path.display().to_string()
+        ))
+        .spawn()
+        .expect("python3");
+    std::thread::sleep(Duration::from_millis(800));
+
+    let gib = 1024u64 * 1024 * 1024;
+    let tight_disk = move || vassoura::disk::Disk { total: 200 * gib, free: 20 * gib };
+    let rep = vassoura::daemon::run_cycle_sampling(&cfg, tight_disk);
+
+    let _ = hold.kill();
+    let _ = hold.wait();
+
+    assert_eq!(rep.removed, 0, "active .cargo-lock must forbid target salvage");
+    assert!(proj.join("target/debug/deps").exists(), "deps stays untouched during active build");
+}
+
+#[test]
+fn clean_allows_eviction_when_only_passive_directory_fd_is_open_but_blocks_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = tmp.path().join("projetos");
+
+    let nm_watched = root.join("watched/node_modules");
+    mkfile(&root.join("watched/package.json"), 20);
+    mkfile(&nm_watched.join("dep/a.js"), 1000);
+    for p in [&nm_watched.join("dep/a.js"), &nm_watched.join("dep"), &nm_watched, &root.join("watched")] {
+        age_dir(p, 40);
+    }
+
+    let nm_cwd = root.join("shell_here/node_modules");
+    mkfile(&root.join("shell_here/package.json"), 20);
+    mkfile(&nm_cwd.join("dep/b.js"), 1000);
+    for p in [&nm_cwd.join("dep/b.js"), &nm_cwd.join("dep"), &nm_cwd, &root.join("shell_here"), &root] {
+        age_dir(p, 40);
+    }
+
+    let cfg = sandbox_cfg(root.clone(), home.clone());
+
+    let mut hold_watch = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import os, time; fd = os.open({:?}, os.O_RDONLY); time.sleep(25)",
+            nm_watched.display().to_string()
+        ))
+        .spawn()
+        .expect("python3 watch");
+
+    let mut hold_cwd = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import time; time.sleep(25)")
+        .current_dir(&nm_cwd)
+        .spawn()
+        .expect("python3 cwd");
+
+    std::thread::sleep(Duration::from_millis(800));
+
+    let cands = vassoura::walk::scan(&cfg, Some(&root), true);
+    let (items, _) = vassoura::plan::build(cands, &cfg, None);
+    assert_eq!(items.len(), 2);
+    let out = vassoura::clean::apply(&items, &cfg.ledger);
+
+    let _ = hold_watch.kill();
+    let _ = hold_watch.wait();
+    let _ = hold_cwd.kill();
+    let _ = hold_cwd.wait();
+
+    assert!(
+        !nm_watched.exists(),
+        "passive O_RDONLY/kqueue directory watcher (tDIR, fd != cwd) must NOT block eviction: {:?}",
+        out.skipped
+    );
+    assert!(nm_cwd.exists(), "process cwd inside candidate MUST still block eviction");
+    assert_eq!(out.removed, 1);
+}
+
 

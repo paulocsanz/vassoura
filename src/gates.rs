@@ -19,28 +19,36 @@ pub enum UseState {
     Unavailable(String),
 }
 
-fn lsof_probe(args: &[&OsStr]) -> Result<bool, String> {
+fn lsof_probe_active(args: &[&OsStr]) -> Result<bool, String> {
     let out = Command::new("lsof")
         .args(args)
         .output()
         .map_err(|e| format!("spawn lsof: {e}"))?;
-    // lsof's exit code varies (1 even when it found something); the signal is stdout
-    // (-F p prints one "p<pid>" line per process).
-    Ok(!out.stdout.is_empty())
+    // lsof's exit code varies (1 even when it found something); parse -F cftn stdout.
+    let (paths, vm_paths) = parse_lsof_cftn(&String::from_utf8_lossy(&out.stdout));
+    Ok(!paths.is_empty() || !vm_paths.is_empty())
 }
 
 /// Real lsof: a live process with a file open UNDER the directory (+D,
-/// recursive) or with the directory itself open (cwd/fd).
+/// recursive) or with the directory itself open as cwd (`fcwd`).
+/// Passive `O_EVTONLY` / `opendir` directory descriptors (`tDIR` with `fd != cwd`)
+/// from IDE/agent file watchers do not count as active use.
 pub fn lsof_state(path: &Path) -> UseState {
     let p = path.as_os_str();
-    let under = ["-w", "-F", "p", "+D"].iter().map(|s| OsStr::new(*s)).chain(std::iter::once(p));
-    match lsof_probe(&under.collect::<Vec<_>>()) {
+    let under = ["-n", "-P", "-w", "-F", "cftn", "+D"]
+        .iter()
+        .map(|s| OsStr::new(*s))
+        .chain(std::iter::once(p));
+    match lsof_probe_active(&under.collect::<Vec<_>>()) {
         Ok(true) => return UseState::InUse("process has a file open (lsof +D)".into()),
         Err(e) => return UseState::Unavailable(e),
         Ok(false) => {}
     }
-    let itself = ["-w", "-F", "p", "--"].iter().map(|s| OsStr::new(*s)).chain(std::iter::once(p));
-    match lsof_probe(&itself.collect::<Vec<_>>()) {
+    let itself = ["-n", "-P", "-w", "-F", "cftn", "--"]
+        .iter()
+        .map(|s| OsStr::new(*s))
+        .chain(std::iter::once(p));
+    match lsof_probe_active(&itself.collect::<Vec<_>>()) {
         Ok(true) => UseState::InUse("process has the directory open (lsof cwd/fd)".into()),
         Err(e) => UseState::Unavailable(e),
         Ok(false) => UseState::Free,
@@ -195,11 +203,63 @@ fn is_transient_search_or_indexer(cmd: &str) -> bool {
     let base = cmd.rsplit('/').next().unwrap_or(cmd);
     matches!(
         base,
-        "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" | "ag" | "ack" | "find" |
-        "mdfind" | "mds" | "mdworker" | "mdworker_shared" | "fseventsd" |
+        "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" | "ag" | "ack" | "find" | "bfs" |
+        "fd" | "fdfind" | "du" | "ncdu" | "dust" | "tree" | "ls" | "exa" | "eza" |
+        "mdfind" | "mds" | "mdworker" | "mdworker_shared" | "fseventsd" | "watchman" |
         "file" | "stat" | "cat" | "head" | "tail" | "wc" | "less" | "more" |
         "strings" | "nm" | "objdump" | "otool"
     )
+}
+
+/// Passive directory descriptors (`tDIR` with `fd != "cwd"` and `fd != "rtd"`):
+/// IDE / agent file watchers (`claude`, `Cursor`, `Code`, Chokidar `kqueue`) open
+/// thousands of `O_EVTONLY` / `O_RDONLY` directory handles (`f*000..*999`, `tDIR`)
+/// across `node_modules/`, `.turbo/`, and `target/`. Unlike `fcwd` (active working
+/// directory) or `tREG`/`ftxt` (open files, compiler locks, mapped binaries), passive
+/// `DIR` fds cannot write or execute anything and cleanly close on `NOTE_DELETE`.
+pub(crate) fn is_passive_dir_fd(fd: &str, ftype: &str) -> bool {
+    ftype == "DIR" && fd != "cwd" && fd != "rtd"
+}
+
+pub(crate) fn parse_lsof_cftn(stdout: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut paths = Vec::new();
+    let mut vm_paths = Vec::new();
+    let mut is_vm = false;
+    let mut is_transient = false;
+    let mut fd = "";
+    let mut ftype = "";
+    for line in stdout.lines() {
+        if let Some(cmd) = line.strip_prefix('c') {
+            let cmd_name = cmd.trim();
+            is_vm = is_vm_hypervisor(cmd_name);
+            is_transient = is_transient_search_or_indexer(cmd_name);
+            fd = "";
+            ftype = "";
+            continue;
+        }
+        if let Some(f) = line.strip_prefix('f') {
+            fd = f.trim();
+            ftype = "";
+            continue;
+        }
+        if let Some(t) = line.strip_prefix('t') {
+            ftype = t.trim();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix('n') else { continue };
+        if is_transient || is_passive_dir_fd(fd, ftype) {
+            continue;
+        }
+        if rest.starts_with('/') {
+            let p = PathBuf::from(rest);
+            if is_vm {
+                vm_paths.push(p);
+            } else {
+                paths.push(p);
+            }
+        }
+    }
+    (paths, vm_paths)
 }
 
 pub struct GateSession {
@@ -224,6 +284,42 @@ pub fn prepare(paths: &[&Path]) -> GateSession {
 }
 
 impl GateSession {
+    /// Populate git status for any additional candidate paths introduced after `prepare`
+    /// (e.g. Cargo `target/` sub-artifact salvage candidates).
+    pub fn ensure_repos(&mut self, paths: &[&Path]) {
+        use std::collections::HashSet;
+        let missing: HashSet<PathBuf> = paths
+            .iter()
+            .filter_map(|p| nearest_repo(p))
+            .filter(|r| !self.git.contains_key(r))
+            .collect();
+        if !missing.is_empty() {
+            self.git.extend(git_many(missing));
+        }
+    }
+
+    /// True when Cargo is actively holding `.cargo-lock` or `.cargo-build-lock` open
+    /// anywhere inside `target_dir` (meaning an active `cargo` command is running).
+    pub fn has_cargo_lock_open(&self, target_dir: &Path) -> bool {
+        let is_lock = |p: &Path| {
+            matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some(".cargo-lock" | ".cargo-build-lock")
+            )
+        };
+        if self.open_paths.iter().any(|p| p.starts_with(target_dir) && is_lock(p)) {
+            return true;
+        }
+        if let Ok(canon) = std::fs::canonicalize(target_dir) {
+            if canon != target_dir
+                && self.open_paths.iter().any(|p| p.starts_with(&canon) && is_lock(p))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn check(&self, path: &Path) -> Option<String> {
         self.check_candidate_policy(path, Class::Artifact, false)
     }
@@ -297,34 +393,10 @@ fn git_dirty_files_timeout(repo: &Path) -> Result<Vec<PathBuf>, String> {
 /// then falls back to a single batch check on the candidate paths.
 fn lsof_snapshot() -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let out = crate::procutil::output_with_timeout(
-        Command::new("lsof").args(["-n", "-P", "-w", "-F", "cn"]),
+        Command::new("lsof").args(["-n", "-P", "-w", "-F", "cftn"]),
         std::time::Duration::from_secs(45),
     )?;
-    let mut paths = Vec::new();
-    let mut vm_paths = Vec::new();
-    let mut is_vm = false;
-    let mut is_transient = false;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(cmd) = line.strip_prefix('c') {
-            let cmd_name = cmd.trim();
-            is_vm = is_vm_hypervisor(cmd_name);
-            is_transient = is_transient_search_or_indexer(cmd_name);
-            continue;
-        }
-        let Some(rest) = line.strip_prefix('n') else { continue };
-        if is_transient {
-            continue;
-        }
-        if rest.starts_with('/') {
-            let p = PathBuf::from(rest);
-            if is_vm {
-                vm_paths.push(p);
-            } else {
-                paths.push(p);
-            }
-        }
-    }
-    Ok((paths, vm_paths))
+    Ok(parse_lsof_cftn(&String::from_utf8_lossy(&out.stdout)))
 }
 
 fn lsof_batch_cwd_timeout(paths: &[&Path]) -> Result<Vec<PathBuf>, String> {
@@ -334,28 +406,13 @@ fn lsof_batch_cwd_timeout(paths: &[&Path]) -> Result<Vec<PathBuf>, String> {
     let mut opens = Vec::new();
     for chunk in paths.chunks(100) {
         let mut cmd = Command::new("lsof");
-        cmd.args(["-n", "-P", "-w", "-F", "cn", "--"]);
+        cmd.args(["-n", "-P", "-w", "-F", "cftn", "--"]);
         for p in chunk {
             cmd.arg(p);
         }
         let out = crate::procutil::output_with_timeout(&mut cmd, std::time::Duration::from_secs(15))?;
-        let mut is_vm = false;
-        let mut is_transient = false;
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Some(cmd) = line.strip_prefix('c') {
-                let cmd_name = cmd.trim();
-                is_vm = is_vm_hypervisor(cmd_name);
-                is_transient = is_transient_search_or_indexer(cmd_name);
-                continue;
-            }
-            let Some(rest) = line.strip_prefix('n') else { continue };
-            if is_transient {
-                continue;
-            }
-            if rest.starts_with('/') && !is_vm {
-                opens.push(PathBuf::from(rest));
-            }
-        }
+        let (chunk_paths, _) = parse_lsof_cftn(&String::from_utf8_lossy(&out.stdout));
+        opens.extend(chunk_paths);
     }
     Ok(opens)
 }
@@ -660,10 +717,98 @@ mod tests {
         assert!(is_transient_search_or_indexer("/usr/bin/grep"));
         assert!(is_transient_search_or_indexer("rg"));
         assert!(is_transient_search_or_indexer("find"));
+        assert!(is_transient_search_or_indexer("bfs"));
+        assert!(is_transient_search_or_indexer("du"));
         assert!(is_transient_search_or_indexer("mdworker"));
         assert!(!is_transient_search_or_indexer("rustc"));
         assert!(!is_transient_search_or_indexer("cargo"));
         assert!(!is_transient_search_or_indexer("node"));
     }
-}
 
+    #[test]
+    fn parse_lsof_ignores_passive_dir_watchers_but_keeps_cwd_and_open_files() {
+        // Real macOS lsof -F cftn shape from 2026-10-30 incident:
+        // - `claude` holds thousands of `f*000..*999` + `tDIR` kqueue watches on node_modules & target
+        // - `zsh` holds `fcwd` + `tDIR` inside an active shell directory
+        // - `caixote-api` holds `ftxt` + `tREG` on target/debug/caixote-api
+        // - `cargo` holds `f8` + `tREG` on target/debug/.cargo-lock
+        let sample = "\
+cclaude\n\
+f*000\n\
+tDIR\n\
+n/Users/paulo/software/bosque/node_modules/.pnpm/next\n\
+f*001\n\
+tDIR\n\
+n/Users/paulo/software/substrato/target/debug/build\n\
+czsh\n\
+fcwd\n\
+tDIR\n\
+n/Users/paulo/software/active_shell/target\n\
+ccaixote-api\n\
+ftxt\n\
+tREG\n\
+n/Users/paulo/software/caixote/target/debug/caixote-api\n\
+ccargo\n\
+f8\n\
+tREG\n\
+n/Users/paulo/software/forja/engine/target/debug/.cargo-lock\n\
+ccom.apple.Virtualization.VirtualMachine\n\
+f42\n\
+tREG\n\
+n/Users/paulo/software/vm_guest/target/debug/libfoo.rlib\n";
+
+        let (paths, vm_paths) = parse_lsof_cftn(sample);
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/Users/paulo/software/bosque")),
+            "passive claude kqueue DIR watches must not block eviction: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/Users/paulo/software/substrato")),
+            "passive DIR watches on target subdirs must not block eviction: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("/Users/paulo/software/active_shell/target")),
+            "process cwd (fcwd + tDIR) MUST block eviction: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("/Users/paulo/software/caixote/target/debug/caixote-api")),
+            "running binary (ftxt + tREG) MUST be recorded: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("/Users/paulo/software/forja/engine/target/debug/.cargo-lock")),
+            "cargo lock (tREG) MUST be recorded: {paths:?}"
+        );
+        assert_eq!(
+            vm_paths,
+            vec![PathBuf::from("/Users/paulo/software/vm_guest/target/debug/libfoo.rlib")]
+        );
+    }
+
+    #[test]
+    fn cargo_lock_detection_distinguishes_running_daemon_from_active_cargo_build() {
+        let daemon_only = GateSession {
+            git: std::collections::HashMap::new(),
+            open_paths: vec![PathBuf::from("/p/caixote/target/debug/caixote-api")],
+            vm_open_paths: Vec::new(),
+            lsof_err: None,
+        };
+        assert!(
+            !daemon_only.has_cargo_lock_open(Path::new("/p/caixote/target")),
+            "running binary without .cargo-lock allows intermediate deps/incremental salvage"
+        );
+
+        let active_cargo = GateSession {
+            git: std::collections::HashMap::new(),
+            open_paths: vec![
+                PathBuf::from("/p/caixote/target/debug/caixote-api"),
+                PathBuf::from("/p/caixote/target/debug/.cargo-lock"),
+            ],
+            vm_open_paths: Vec::new(),
+            lsof_err: None,
+        };
+        assert!(
+            active_cargo.has_cargo_lock_open(Path::new("/p/caixote/target")),
+            "active .cargo-lock forbids any salvage inside target/"
+        );
+    }
+}

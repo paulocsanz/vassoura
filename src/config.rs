@@ -108,6 +108,11 @@ pub struct ToolsCfg {
     #[serde(default = "default_rustup_keep")]
     pub rustup_keep: usize,
     #[serde(default = "default_true")]
+    pub elan: bool,
+    /// How many of the newest versioned Lean (elan) toolchains to keep.
+    #[serde(default = "default_elan_keep")]
+    pub elan_keep: usize,
+    #[serde(default = "default_true")]
     pub pnpm: bool,
     #[serde(default = "default_true")]
     pub go: bool,
@@ -119,6 +124,9 @@ fn default_true() -> bool {
 fn default_rustup_keep() -> usize {
     3
 }
+fn default_elan_keep() -> usize {
+    2
+}
 
 impl Default for ToolsCfg {
     fn default() -> Self {
@@ -127,6 +135,8 @@ impl Default for ToolsCfg {
             docker: true,
             rustup: true,
             rustup_keep: default_rustup_keep(),
+            elan: true,
+            elan_keep: default_elan_keep(),
             pnpm: true,
             go: true,
         }

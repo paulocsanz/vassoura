@@ -219,12 +219,66 @@ pub struct CycleReport {
     pub removed: usize,
     pub freed: u64,
     pub skipped: Vec<(std::path::PathBuf, String)>,
-    /// Scan ran in shallow probe mode (scan-health breaker active).
+    /// Scan ran in shallow probe mode (scan-health breaker active) or lost all workers.
     pub degraded: bool,
+    /// Full scan hit the cycle deadline on deep hunts and supplemented missing entries via probe.
+    pub deadline_truncated: bool,
     /// Set on the transition into degraded mode: the caller notifies.
     pub notify_msg: Option<String>,
     /// What the scan pool reported about its own health this cycle.
     pub health: crate::scan_pool::ScanHealth,
+}
+
+/// Salvage pure intermediate compilation subtrees (`deps`, `incremental`, `build`,
+/// and idle cross-targets) from Cargo `target/` directories whose root was skipped
+/// due to a running binary (e.g. `target/debug/caixote-api` held as `ftxt` in `lsof`)
+/// or mixed profile ages, provided no active `.cargo-lock` is held open.
+pub fn salvage_pinned_cargo_targets(
+    salvage_roots: &[std::path::PathBuf],
+    cfg: &Config,
+    min_override: Option<f64>,
+    mut seen: Option<&mut SeenDb>,
+    gates: &mut crate::gates::GateSession,
+    now_emergency: bool,
+    now: SystemTime,
+) -> (Vec<plan::PlanItem>, Vec<(std::path::PathBuf, String)>) {
+    let mut sub_cands = Vec::new();
+    for target_dir in salvage_roots {
+        if gates.has_cargo_lock_open(target_dir) {
+            continue;
+        }
+        let found = walk::salvage_cargo_target_subcandidates(cfg, target_dir, &|p| {
+            gates
+                .check_candidate_policy(p, walk::Class::Artifact, now_emergency)
+                .is_some()
+        });
+        sub_cands.extend(found);
+    }
+    if sub_cands.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let sub_paths: Vec<&Path> = sub_cands.iter().map(|c| c.path.as_path()).collect();
+    gates.ensure_repos(&sub_paths);
+    if let Some(s) = seen.as_deref_mut() {
+        s.refresh(&sub_cands, now);
+    }
+    let (sub_items, _) = match seen.as_deref() {
+        Some(s) => plan::build_seen_emergency(sub_cands, cfg, min_override, s, now_emergency),
+        None => plan::build_emergency(sub_cands, cfg, min_override, now_emergency),
+    };
+    let mut free_sub = Vec::new();
+    let mut skipped_sub = Vec::new();
+    for item in sub_items {
+        if let Some(why) = gates.check_candidate(&item.cand, now_emergency) {
+            if let Some(s) = seen.as_deref_mut() {
+                s.mark_active(&item.cand.path, now);
+            }
+            skipped_sub.push((item.cand.path, why));
+        } else {
+            free_sub.push(item);
+        }
+    }
+    (free_sub, skipped_sub)
 }
 
 /// One daemon cycle: scan → seen.db → **re-stat** → statusfs → decision →
@@ -292,14 +346,16 @@ pub fn run_cycle_sampling_opts(
             // even in full mode, so the report never lies about coverage
             let lost = health.worker_deaths + health.silence_kills + health.spawn_failures + health.deadline_stopped;
             let truncated = health.jobs_uncompleted > 0 || health.deadline_stopped > 0;
-            if (c.is_empty() && (lost > 0 || health.in_process_fallback)) || truncated {
+            if c.is_empty() && (lost > 0 || health.in_process_fallback) {
                 rep.degraded = true;
+            } else if truncated {
+                rep.deadline_truncated = true;
             }
             if is_emergency || truncated {
-                for pc in walk::scan_probe(cfg, None) {
-                    if !c.iter().any(|existing| existing.path == pc.path) {
-                        c.push(pc);
-                    }
+                let already: std::collections::HashSet<std::path::PathBuf> =
+                    c.iter().map(|existing| existing.path.clone()).collect();
+                for pc in walk::scan_probe_missing(cfg, None, &already) {
+                    c.push(pc);
                 }
             }
             rep.health = health;
@@ -334,7 +390,17 @@ pub fn run_cycle_sampling_opts(
         None
     };
 
-    let (items, _rejected) = plan::build_seen_emergency(cands, cfg, min_override, &seen, now_emergency);
+    let young_cargo_targets: Vec<std::path::PathBuf> = cands
+        .iter()
+        .filter(|c| walk::is_cargo_target_candidate(c))
+        .map(|c| c.path.clone())
+        .collect();
+    let (mut items, rejected) = plan::build_seen_emergency(cands, cfg, min_override, &seen, now_emergency);
+    let rejected_young_targets: Vec<std::path::PathBuf> = rejected
+        .iter()
+        .filter(|r| r.reason.starts_with("young:") && young_cargo_targets.contains(&r.path))
+        .map(|r| r.path.clone())
+        .collect();
     rep.eligible_bytes = items.iter().map(|i| i.cand.bytes).sum();
 
     // status fs (P2.2): the same values as `status --json`
@@ -371,23 +437,44 @@ pub fn run_cycle_sampling_opts(
             if !now_emergency && rate_limited(seen.last_eviction, now, rl) {
                 rep.rate_limited = true;
             } else if need_bytes > 0 {
-                // Invariant & Performance: only gate-check a bounded window of the highest-scoring
-                // candidates (up to 3x cap_items, clamped between 60 and 150). Full seen sets can contain
-                // 5,000+ items; running git status or lsof checks on thousands of paths under disk pressure
-                // is slow and triggers lsof timeout deadlocks.
-                let check_window = (cap_items * 3).clamp(60, 150);
+                // Sort BEFORE slicing `check_window` so GiB-scale candidates (>= SLOT_FLOOR)
+                // are never truncated behind hundreds of tiny `__pycache__` dust entries.
+                plan::sort_eviction_order(&mut items);
+                let check_window = (cap_items * 2).clamp(60, 400);
                 let check_items: Vec<_> = items.into_iter().take(check_window).collect();
                 let candidate_paths: Vec<&Path> = check_items.iter().map(|i| i.cand.path.as_path()).collect();
-                let gates = crate::gates::prepare(&candidate_paths);
+                let mut gates = crate::gates::prepare(&candidate_paths);
 
                 let mut free_items = Vec::new();
+                let mut salvage_roots: Vec<std::path::PathBuf> = rejected_young_targets;
                 for item in check_items {
                     if let Some(why) = gates.check_candidate(&item.cand, now_emergency) {
                         seen.mark_active(&item.cand.path, SystemTime::now());
+                        if walk::is_cargo_target_candidate(&item.cand)
+                            && !salvage_roots.contains(&item.cand.path)
+                        {
+                            salvage_roots.push(item.cand.path.clone());
+                        }
                         rep.skipped.push((item.cand.path.clone(), why));
                     } else {
                         free_items.push(item);
                     }
+                }
+
+                if !salvage_roots.is_empty() {
+                    let (salvaged, salvaged_skipped) = salvage_pinned_cargo_targets(
+                        &salvage_roots,
+                        cfg,
+                        min_override,
+                        Some(&mut seen),
+                        &mut gates,
+                        now_emergency,
+                        now,
+                    );
+                    let salvaged_bytes: u64 = salvaged.iter().map(|i| i.cand.bytes).sum();
+                    rep.eligible_bytes = rep.eligible_bytes.saturating_add(salvaged_bytes);
+                    free_items.extend(salvaged);
+                    rep.skipped.extend(salvaged_skipped);
                 }
 
                 let packed = plan::pack_capped(free_items, d_now.free, cfg.until_free_gib, cap_items, Some(cap_bytes));
